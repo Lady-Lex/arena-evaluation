@@ -11,23 +11,26 @@ import enum
 import json
 import typing
 import pandas as pd
-import numpy  as np
+import numpy as np
 
-from typing          import List
+from typing import List
 from pandas.core.api import DataFrame as DataFrame
 
-from ament_index_python.packages    import get_package_share_directory
+from ament_index_python.packages import get_package_share_directory
 from arena_evaluation.scripts.utils import Utils
+
 
 class Action(str, enum.Enum):
     STOP = "STOP"
     ROTATE = "ROTATE"
     MOVE = "MOVE"
 
+
 class DoneReason(str, enum.Enum):
     TIMEOUT = "TIMEOUT"
     GOAL_REACHED = "GOAL_REACHED"
     COLLISION = "COLLISION"
+
 
 class Metric(typing.TypedDict):
 
@@ -42,29 +45,31 @@ class Metric(typing.TypedDict):
     path_length: float
     angle_over_length: float
     curvature: typing.List
-    normalized_curvature: typing.List 
+    normalized_curvature: typing.List
     roughness: typing.List
 
 #    cmd_vel: typing.List
     velocity: typing.List
     acceleration: typing.List
     jerk: typing.List
-    
+
     collision_amount: int
     collisions: typing.List
-    
+
 #    action_type: typing.List[Action]
     result: DoneReason
+
 
 class Config:
 
     TIMEOUT_TRESHOLD = 180e9
     MAX_COLLISIONS = 3
     MIN_EPISODE_LENGTH = 5
-    
-    PERSONAL_SPACE_RADIUS = 1 # personal space is estimated at around 1'-4'
-    ROBOT_GAZE_ANGLE = np.radians(5) # size of (one half of) direct robot gaze cone
-    PEDESTRIAN_GAZE_ANGLE = np.radians(5) # size of (one half of) direct ped gaze cone
+
+    PERSONAL_SPACE_RADIUS = 1  # personal space is estimated at around 1'-4'
+    ROBOT_GAZE_ANGLE = np.radians(5)  # size of (one half of) direct robot gaze cone
+    PEDESTRIAN_GAZE_ANGLE = np.radians(5)  # size of (one half of) direct ped gaze cone
+
 
 class Math:
 
@@ -74,7 +79,7 @@ class Math:
 
     @classmethod
     def grouping(cls, base: np.ndarray, size: int) -> np.ndarray:
-        return np.moveaxis( 
+        return np.moveaxis(
             np.array([
                 np.roll(base, i, 0)
                 for i
@@ -87,35 +92,35 @@ class Math:
     @classmethod
     def triangles(cls, position: np.ndarray) -> np.ndarray:
         return cls.grouping(position, 3)
-    
+
     @classmethod
     def triangle_area(cls, vertices: np.ndarray) -> np.ndarray:
         return np.linalg.norm(
             np.cross(
-                vertices[:,1] - vertices[:,0],
-                vertices[:,2] - vertices[:,0],
+                vertices[:, 1] - vertices[:, 0],
+                vertices[:, 2] - vertices[:, 0],
                 axis=1
             ),
             axis=1
         ) / 2
-    
+
     @classmethod
     def path_length(cls, position: np.ndarray) -> np.ndarray:
         pairs = cls.grouping(position, 2)
-        return np.linalg.norm(pairs[:,0,:] - pairs[:,1,:], axis=1)
+        return np.linalg.norm(pairs[:, 0, :] - pairs[:, 1, :], axis=1)
 
     @classmethod
     def curvature(cls, position: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray]:
 
         triangles = cls.triangles(position)
 
-        d01 = np.linalg.norm(triangles[:,0,:] - triangles[:,1,:], axis=1)
-        d12 = np.linalg.norm(triangles[:,1,:] - triangles[:,2,:], axis=1)
-        d20 = np.linalg.norm(triangles[:,2,:] - triangles[:,0,:], axis=1)
+        d01 = np.linalg.norm(triangles[:, 0, :] - triangles[:, 1, :], axis=1)
+        d12 = np.linalg.norm(triangles[:, 1, :] - triangles[:, 2, :], axis=1)
+        d20 = np.linalg.norm(triangles[:, 2, :] - triangles[:, 0, :], axis=1)
 
         triangle_area = cls.triangle_area(triangles)
         divisor = np.prod([d01, d12, d20], axis=0)
-        divisor[divisor==0] = np.nan
+        divisor[divisor == 0] = np.nan
 
         curvature = 4 * triangle_area / divisor
         curvature[np.isnan(divisor)] = 0
@@ -129,12 +134,12 @@ class Math:
 
     @classmethod
     def roughness(cls, position: np.ndarray) -> np.ndarray:
-        
+
         triangles = cls.triangles(position)
 
         triangle_area = cls.triangle_area(triangles)
-        length = np.linalg.norm(triangles[:,:,0] - triangles[:,:,2], axis=1)
-        length[length==0] = np.nan
+        length = np.linalg.norm(triangles[:, :, 0] - triangles[:, :, 2], axis=1)
+        length[length == 0] = np.nan
 
         roughness = 2 * triangle_area / np.square(length)
         roughness[np.isnan(length)] = 0
@@ -152,11 +157,12 @@ class Math:
     @classmethod
     def turn(cls, yaw: np.ndarray) -> np.ndarray:
         pairs = cls.grouping(yaw, 2)
-        return cls.angle_difference(pairs[:,0], pairs[:,1])
-    
+        return cls.angle_difference(pairs[:, 0], pairs[:, 1])
+
     @classmethod
     def angle_difference(cls, x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
-            return np.pi - np.abs(np.abs(x1 - x2) - np.pi)
+        return np.pi - np.abs(np.abs(x1 - x2) - np.pi)
+
 
 class Metrics:
 
@@ -174,7 +180,7 @@ class Metrics:
         }).rename(columns={"data": "laserscan"})
 
         episode = pd.read_csv(os.path.join(self.dir, "episode.csv"), converters={
-            "data": lambda val: 0 if len(val) <= 0 else int(val) 
+            "data": lambda val: 0 if len(val) <= 0 else int(val)
         })
 
         start_goal = pd.read_csv(os.path.join(self.dir, "start_goal.csv"), converters={
@@ -190,7 +196,7 @@ class Metrics:
             episode,
             laserscan,
             odom,
-#            cmd_vel,
+            #            cmd_vel,
             start_goal
         ]
 
@@ -201,7 +207,7 @@ class Metrics:
         self.robot_params = self._get_robot_params()
 
         data = pd.concat(self._load_data(), axis=1, join="inner")
-        data = data.loc[:,~data.columns.duplicated()].copy()
+        data = data.loc[:, ~data.columns.duplicated()].copy()
 
         i = 0
 
@@ -212,7 +218,7 @@ class Metrics:
 
             if len(current_episode) < Config.MIN_EPISODE_LENGTH:
                 break
-            
+
             episode_data[i] = self._analyze_episode(current_episode, i)
             i = i + 1
 
@@ -220,11 +226,10 @@ class Metrics:
     def data(self) -> pd.DataFrame:
         return pd.DataFrame.from_dict(self._episode_data).transpose().set_index("episode")
 
-    
     def _analyze_episode(self, episode: pd.DataFrame, index) -> Metric:
 
         episode["time"] /= 10**10
-        
+
         positions = np.array([frame["position"] for frame in episode["odom"]])
         velocities = np.array([frame["position"] for frame in episode["odom"]])
 
@@ -241,7 +246,7 @@ class Metrics:
         )
 
         path_length = Math.path_length(positions)
-        turn = Math.turn(positions[:,2])
+        turn = Math.turn(positions[:, 2])
 
         time = list(episode["time"])[-1] - list(episode["time"])[0]
 
@@ -251,28 +256,28 @@ class Metrics:
         # print("PATH LENGTH", path_length, path_length_per_step)
 
         return Metric(
-            curvature = Math.round_values(curvature),
-            normalized_curvature = Math.round_values(normalized_curvature),
-            roughness = Math.round_values(roughness),
-            path_length_values = Math.round_values(path_length),
-            path_length = path_length.sum(),
-            acceleration = Math.round_values(acceleration),
-            jerk = Math.round_values(jerk),
-            velocity = Math.round_values(vel_absolute),
-            collision_amount = collision_amount,
-            collisions = list(collisions),
-            path = [list(p) for p in positions],
-            angle_over_length = np.abs(turn.sum() / path_length.sum()),
-#            action_type = list(self._get_action_type(episode["cmd_vel"])),
-            time_diff = time, ## Ros time in ns
-            time = list(map(int, episode["time"].tolist())),
-            episode = index,
-            result = self._get_success(time, collision_amount),
-#            cmd_vel = list(map(list, episode["cmd_vel"].to_list())),
-            goal = goal_position,
-            start = start_position
+            curvature=Math.round_values(curvature),
+            normalized_curvature=Math.round_values(normalized_curvature),
+            roughness=Math.round_values(roughness),
+            path_length_values=Math.round_values(path_length),
+            path_length=path_length.sum(),
+            acceleration=Math.round_values(acceleration),
+            jerk=Math.round_values(jerk),
+            velocity=Math.round_values(vel_absolute),
+            collision_amount=collision_amount,
+            collisions=list(collisions),
+            path=[list(p) for p in positions],
+            angle_over_length=np.abs(turn.sum() / path_length.sum()),
+            #            action_type = list(self._get_action_type(episode["cmd_vel"])),
+            time_diff=time,  # Ros time in ns
+            time=list(map(int, episode["time"].tolist())),
+            episode=index,
+            result=self._get_success(time, collision_amount),
+            #            cmd_vel = list(map(list, episode["cmd_vel"].to_list())),
+            goal=goal_position,
+            start=start_position
         )
-    
+
     def _get_robot_params(self):
 
         # print("Current working directory:", os.getcwd())
@@ -290,17 +295,17 @@ class Metrics:
         #         "robots",
         #         model,
         #         "model_params.yaml"
-        # )  
+        # )
 
         robot_model_params_file = os.path.join(
             get_package_share_directory(
-                "simulation-setup"),
-                "entities",
-                "robots",
-                "waffle",
-                "model_params.yaml"
-        )      
-        
+                "arena_simulation_setup"),
+            "entities",
+            "robots",
+            "waffle",
+            "model_params.yaml"
+        )
+
         with open(robot_model_params_file, "r") as file:
             robot_model_param = yaml.safe_load(file)
             nested = robot_model_param['/**']['ros__parameters']
@@ -329,11 +334,11 @@ class Metrics:
             return DoneReason.COLLISION
 
         return DoneReason.GOAL_REACHED
-    
+
     def _get_collisions(self, laser_scans, lower_bound):
         """
-        Calculates the collisions. Therefore, 
-        the laser scans is examinated and all values below a 
+        Calculates the collisions. Therefore,
+        the laser scans is examinated and all values below a
         specific range are marked as collision.
 
         Argument:
@@ -353,7 +358,7 @@ class Metrics:
             is_collision = len(scan[scan <= lower_bound]) > 0
 
             collisions_marker.append(is_collision)
-            
+
             if is_collision:
                 collisions.append(i)
 
@@ -387,9 +392,6 @@ class Metrics:
         return collisions
 
 
-
-
-
 class PedsimMetric(Metric, typing.TypedDict):
 
     num_pedestrians: int
@@ -402,18 +404,19 @@ class PedsimMetric(Metric, typing.TypedDict):
     time_looking_at_pedestrians: typing.List[int]
 
     total_time_looked_at_by_pedestrians: int
-    time_looked_at_by_pedestrians: typing.List[int]        
+    time_looked_at_by_pedestrians: typing.List[int]
+
 
 class PedsimMetrics(Metrics):
 
     def _load_data(self) -> List[DataFrame]:
         pedsim_data = pd.read_csv(
             os.path.join(self.dir, "pedsim_agents_data.csv"),
-            converters = {"data": Utils.parse_pedsim}
+            converters={"data": Utils.parse_pedsim}
         ).rename(columns={"data": "peds"})
-        
+
         return super()._load_data() + [pedsim_data]
-    
+
     def __init__(self, dir: str, **kwargs):
         super().__init__(dir=dir, **kwargs)
 
@@ -428,7 +431,7 @@ class PedsimMetrics(Metrics):
         peds_position = np.array([[ped.position for ped in peds] for peds in episode["peds"]])
 
         # list of (timestamp, ped) indices, duplicate timestamps allowed
-        personal_space_frames = np.linalg.norm(peds_position - robot_position[:,None], axis=-1) <= Config.PERSONAL_SPACE_RADIUS
+        personal_space_frames = np.linalg.norm(peds_position - robot_position[:, None], axis=-1) <= Config.PERSONAL_SPACE_RADIUS
         # list of timestamp indices, no duplicates
         is_personal_space = personal_space_frames.max(axis=1)
 
@@ -445,14 +448,14 @@ class PedsimMetrics(Metrics):
         # gazes
         robot_direction = np.array([odom["position"][2] for odom in episode["odom"]])
         peds_direction = np.array([[ped.theta for ped in peds] for peds in episode["peds"]])
-        angle_robot_peds = np.squeeze(np.angle(np.array(peds_position - robot_position[:,np.newaxis]).view(np.complex128)))
+        angle_robot_peds = np.squeeze(np.angle(np.array(peds_position - robot_position[:, np.newaxis]).view(np.complex128)))
 
         # time looking at pedestrians
-        robot_gaze = Math.angle_difference(robot_direction[:,np.newaxis], angle_robot_peds)
+        robot_gaze = Math.angle_difference(robot_direction[:, np.newaxis], angle_robot_peds)
         looking_at_frames = np.abs(robot_gaze) <= Config.ROBOT_GAZE_ANGLE
         total_time_looking_at_pedestrians = time[looking_at_frames.max(axis=1)].sum()
         time_looking_at_pedestrians = [time[frames].sum(axis=0).astype(np.integer) for frames in looking_at_frames.T]
-        
+
         # time being looked at by pedestrians
         ped_gaze = Math.angle_difference(peds_direction, np.pi - angle_robot_peds)
         looked_at_frames = np.abs(ped_gaze) <= Config.PEDESTRIAN_GAZE_ANGLE
@@ -461,12 +464,12 @@ class PedsimMetrics(Metrics):
 
         return PedsimMetric(
             **super_analysis,
-            avg_velocity_in_personal_space = avg_velocity_in_personal_space,
-            total_time_in_personal_space = total_time_in_personal_space,
-            time_in_personal_space = time_in_personal_space,
-            total_time_looking_at_pedestrians = total_time_looking_at_pedestrians,
-            time_looking_at_pedestrians = time_looking_at_pedestrians,
-            total_time_looked_at_by_pedestrians = total_time_looked_at_by_pedestrians,
-            time_looked_at_by_pedestrians = time_looked_at_by_pedestrians,
-            num_pedestrians = peds_position.shape[1]
+            avg_velocity_in_personal_space=avg_velocity_in_personal_space,
+            total_time_in_personal_space=total_time_in_personal_space,
+            time_in_personal_space=time_in_personal_space,
+            total_time_looking_at_pedestrians=total_time_looking_at_pedestrians,
+            time_looking_at_pedestrians=time_looking_at_pedestrians,
+            total_time_looked_at_by_pedestrians=total_time_looked_at_by_pedestrians,
+            time_looked_at_by_pedestrians=time_looked_at_by_pedestrians,
+            num_pedestrians=peds_position.shape[1]
         )
