@@ -38,6 +38,8 @@ from rosbag2_py import SequentialWriter, StorageOptions, ConverterOptions, Topic
 
 from hunav_msgs.msg import Agents
 
+
+
 class DataCollector(Node):
 
     def __init__(self, topic, unique_name):
@@ -555,31 +557,19 @@ class BagRecorder(Node):
 
 
 def main(args=None):
-    
     rclpy.init(args=args)
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dir", "-d", default="auto:/")
-    arguments, extra_args = parser.parse_known_args() # Parse the known arguments and ignore the extra_args
-
+    
+    # Create an instance of BagRecorder with your desired directory (e.g., "auto:/")
+    bag_recorder = BagRecorder("auto:/")
+    
     try:
-        recorder = Recorder(arguments.dir)
-
-        executor = MultiThreadedExecutor()
-        executor.add_node(recorder)
-
-        for collector in recorder.data_collectors:
-            executor.add_node(collector)
-
-        executor.spin()
-
-    except Exception as e:
-        print(f"Exception in main: {e}")
-        traceback.print_exc()
+        # Spin the node so that it keeps listening to topics and recording data
+        rclpy.spin(bag_recorder)
+    except KeyboardInterrupt:
+        print("Shutting down rosbag recorder...")
     finally:
-        recorder.destroy_node()
+        bag_recorder.destroy_node()
         rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
-    

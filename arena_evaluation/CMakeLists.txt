@@ -37,6 +37,7 @@ set(dependencies
   nav_msgs
   geometry_msgs
   arena_evaluation_msgs
+  hunav_msgs
 )
 
 # Install Python scripts

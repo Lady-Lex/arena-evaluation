@@ -8,3 +8,6 @@ test.ipynb
 !/data/.gitkeep
 /plots/**
 !/plots/.gitkeep
+log
+build
+install
