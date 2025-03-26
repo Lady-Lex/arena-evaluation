@@ -1,42 +1,36 @@
 #!/usr/bin/env python3
 
+import argparse
+import csv
+import math
 import os
 import re
-import csv
-import time
-import yaml
-import math
-import argparse
 import traceback
-import numpy  as np
-from pathlib  import Path
 from datetime import datetime
 
-from std_msgs.msg       import Int16
-from nav_msgs.msg       import Odometry
-from sensor_msgs.msg    import LaserScan
-from geometry_msgs.msg  import Twist
-from rosgraph_msgs.msg  import Clock
+import rclpy
+import yaml
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import Twist
+from hunav_msgs.msg import Agents
+from nav_msgs.msg import Odometry
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.serialization import serialize_message
+from rosbag2_py import (ConverterOptions, SequentialWriter, StorageOptions,
+                        TopicMetadata)
+from rosgraph_msgs.msg import Clock
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Int16
 # for transformations
 from tf_transformations import euler_from_quaternion
-
-import rclpy
-from rclpy.node                  import Node
-from rclpy.qos                   import QoSProfile
-from rclpy.qos                   import QoSDurabilityPolicy, QoSReliabilityPolicy
-from rclpy.time                  import Time
-from rclpy.parameter             import Parameter
-from rclpy.executors             import MultiThreadedExecutor
-from rclpy.serialization         import serialize_message
-from rosgraph_msgs.msg           import Clock
-from ament_index_python.packages import get_package_share_directory
 
 # from arena_evaluation.scripts.utils import Pedestrian
 # import pedsim_msgs.msg           as pedsim_msgs
 import arena_evaluation_msgs.srv as arena_evaluation_srvs
-from rosbag2_py import SequentialWriter, StorageOptions, ConverterOptions, TopicMetadata
 
-from hunav_msgs.msg import Agents
 
 class DataCollector(Node):
 
@@ -51,14 +45,22 @@ class DataCollector(Node):
             # ("pedsim_agents_data", self.pedsim_callback)
         ]
 
+        # raise ValueError(topic, unique_name)
+
         try:
-            callback = lambda msg: [t[1] for t in topic_callbacks if t[0] == topic[1]][0](msg)
-        except Exception as e:
+            matches = (t[1] for t in topic_callbacks if t[0].endswith(os.path.basename(topic[1])))
+            type_callback = next(matches, lambda x: None)
+
+            def callback(msg):
+                self.msg = msg
+                return type_callback(msg)
+        except BaseException as e:
             self.get_logger().error(f"Error in callback setup: {e}")
             traceback.print_exc()
             return
 
         self.full_topic_name = topic[1]
+        self.msg = None
         self.data = None
 
         self.qos = QoSProfile(
@@ -71,20 +73,20 @@ class DataCollector(Node):
             topic[2],
             topic[0],
             callback,
-            self.qos  
+            self.qos
         )
-    
+
     def laserscan_callback(self, msg_laserscan: LaserScan):
 
         self.data = [msg_laserscan.range_max if math.isnan(val) else round(val, 3) for val in msg_laserscan.ranges]
 
     def odometry_callback(self, msg_odometry: Odometry):
-        
+
         pose3d = msg_odometry.pose.pose
         twist = msg_odometry.twist.twist
 
         roll, pitch, yaw = euler_from_quaternion([
-            pose3d.orientation.x, 
+            pose3d.orientation.x,
             pose3d.orientation.y,
             pose3d.orientation.z,
             pose3d.orientation.w
@@ -94,7 +96,7 @@ class DataCollector(Node):
             "position": [
                 round(pose3d.position.x, 3),
                 round(pose3d.position.y, 3),
-                round(yaw, 3)  
+                round(yaw, 3)
             ],
             "velocity": [
                 round(twist.linear.x, 3),
@@ -103,7 +105,7 @@ class DataCollector(Node):
             ],
         }
 
-    def action_callback(self, msg_action: Twist): # variables will be written to csv whenever an action is published
+    def action_callback(self, msg_action: Twist):  # variables will be written to csv whenever an action is published
 
         self.data = [
             round(msg_action.linear.x, 3),
@@ -112,16 +114,15 @@ class DataCollector(Node):
         ]
 
     def get_data(self):
-        
         return (
             self.full_topic_name,
-            self.data 
+            self.data
         )
-    
+
     def episode_callback(self, msg_scenario_reset):
-        
+
         print(msg_scenario_reset)
-        
+
         self.data = msg_scenario_reset.data
 
     # def pedsim_callback(self, msg_pedsim: pedsim_msgs.PedsimAgentsDataframe):
@@ -138,6 +139,7 @@ class DataCollector(Node):
     #         in msg_pedsim.agent_states
     #     ]
 
+
 class Recorder(Node):
 
     def __init__(self, result_dir):
@@ -148,37 +150,38 @@ class Recorder(Node):
         self.result_dir = self.get_directory(result_dir)
 
         self.declare_parameter("model", "")
-        self.model = self.get_parameter("model").value                                                                          
+        self.model = self.get_parameter("model").value
 
         self.base_dir = get_package_share_directory("arena_evaluation")
-        self.result_dir = os.path.join(self.base_dir, "data", "self.result_dir")
-        #current_script_dir = os.path.dirname(os.path.abspath(__file__))
-        #self.base_dir = os.path.abspath(os.path.join(current_script_dir, '..', '..', '..', 'src', 'arena', 'evaluation', 'arena_evaluation'))
-        #self.result_dir = os.path.join(self.base_dir, "data", self.result_dir)
+        self.result_dir = os.path.join(self.base_dir, "data", self.result_dir)
+        # current_script_dir = os.path.dirname(os.path.abspath(__file__))
+        # self.base_dir = os.path.abspath(os.path.join(current_script_dir, '..', '..', '..', 'src', 'arena', 'evaluation', 'arena_evaluation'))
+        # self.result_dir = os.path.join(self.base_dir, "data", self.result_dir)
         os.makedirs(self.result_dir, exist_ok=True)
-        
+
         self.write_params()
 
         topics_to_monitor = self.get_topics_to_monitor()
-        published_topics = [topic[0] for topic in self.get_topic_names_and_types()] # self.get_topic_names_and_types() is a list of tuples each tuple contain the topic name and a list of types
+        published_topics = [topic[0] for topic in self.get_topic_names_and_types()]  # self.get_topic_names_and_types() is a list of tuples each tuple contain the topic name and a list of types
 
         topic_matcher = re.compile(f"({'|'.join([t[0] for t in topics_to_monitor])})$")
 
         topics_to_sub = []
 
         for topic_name in published_topics:
-            
+
             match = re.search(topic_matcher, topic_name)
 
-            if not match: 
+            if not match:
                 continue
 
-            topics_to_sub.append([topic_name, *self.get_class_for_topic_name(topic_name)])
+            if (topic_class := self.get_class_for_topic_name(topic_name)) is not None:
+                topics_to_sub.append([topic_name, *topic_class])
 
         self.data_collectors = []
 
         self.declare_parameter('start', [0.0, 0.0, 0.0])
-        self.declare_parameter('goal' , [0.0, 0.0, 0.0])
+        self.declare_parameter('goal', [0.0, 0.0, 0.0])
 
         for topic in topics_to_sub:
             topic_name = topic[0]
@@ -186,7 +189,7 @@ class Recorder(Node):
             data_collector = DataCollector(topic, unique_name)
             self.data_collectors.append(data_collector)
             self.write_data(
-                topic[1], 
+                topic[1],
                 ["time", "data"],
                 mode="w"
             )
@@ -209,7 +212,7 @@ class Recorder(Node):
             Clock,
             "/clock",
             self.clock_callback,
-            self.qos  
+            self.qos
         )
 
         self.scenario_reset_sub = self.create_subscription(
@@ -229,20 +232,20 @@ class Recorder(Node):
     def get_directory(self, directory: str):
         AUTO_PREFIX = "auto:/"
         PARAM_AUTO_PREFIX = "data_recorder_autoprefix"
-    
+
         if directory.startswith(AUTO_PREFIX):
             set_prefix = datetime.now().strftime("%y-%m-%d_%H-%M-%S")
             print(f"Generated timestamp: {set_prefix}")
-    
+
             param_value = self.get_parameter(PARAM_AUTO_PREFIX).value
-    
+
             if param_value == "":
                 self.set_parameters([rclpy.parameter.Parameter(PARAM_AUTO_PREFIX, rclpy.Parameter.Type.STRING, set_prefix)])
             else:
                 set_prefix = param_value
-    
+
             directory = os.path.join(str(set_prefix), directory[len(AUTO_PREFIX):])
-    
+
         return directory
 
     def write_params(self):
@@ -285,7 +288,7 @@ class Recorder(Node):
             (f"{namespace}/cmd_vel", Twist),
             # ("/pedsim_simulator/pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe)
         ]
-    
+
     def get_class_for_topic_name(self, topic_name):
         if "/scan" in topic_name:
             return ["scan", LaserScan]
@@ -295,10 +298,10 @@ class Recorder(Node):
             return ["cmd_vel", Twist]
         # if "/pedsim_agents_data" in topic_name:
         #     return ["pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe]
-        
+
     def write_data(self, file_name, data, mode="a"):
-        with open(f"{self.result_dir}/{file_name}.csv", mode, newline = "") as file:
-            writer = csv.writer(file, delimiter = ',')
+        with open(f"{self.result_dir}/{file_name}.csv", mode, newline="") as file:
+            writer = csv.writer(file, delimiter=',')
             writer.writerow(data)
             file.close()
 
@@ -307,13 +310,13 @@ class Recorder(Node):
             return yaml.safe_load(file)
 
     def clock_callback(self, clock: Clock):
-        
+
         current_simulation_action_time = clock.clock.sec * 10e9 + clock.clock.nanosec
 
         if not self.current_time:
             self.current_time = current_simulation_action_time
 
-        time_diff = (current_simulation_action_time - self.current_time) / 1e6 ## in ms
+        time_diff = (current_simulation_action_time - self.current_time) / 1e6  # in ms
 
         if time_diff < self.config["record_frequency"]:
             return
@@ -323,25 +326,26 @@ class Recorder(Node):
         for collector in self.data_collectors:
 
             topic_name, data = collector.get_data()
-            
+
             self.write_data(topic_name, [self.current_time, data])
-        
+
         self.write_data("episode", [self.current_time, self.current_episode])
         self.write_data("start_goal", [
-            self.current_episode, 
-            self.get_parameter('start').value, 
+            self.current_episode,
+            self.get_parameter('start').value,
             self.get_parameter('goal').value
         ])
 
     def scenario_reset_callback(self, data: Int16):
         self.current_episode = data.data
 
-    def change_directory_callback(self, request, response): # ROS2: Change parameters and update configurations on the fly without needing to restart the node
+    def change_directory_callback(self, request, response):  # ROS2: Change parameters and update configurations on the fly without needing to restart the node
         new_directory = request.data
         self.result_dir = self.get_directory(new_directory)
         response.success = True
         response.message = "Directory changed successfully"
-        return response    
+        return response
+
 
 class BagRecorder(Node):
     def __init__(self, result_dir: str):
@@ -352,14 +356,14 @@ class BagRecorder(Node):
 
         self.declare_parameter("model", "")
         self.model = self.get_parameter("model").value
-        
+
         self.declare_parameter("world", "")
         self.world = self.get_parameter("world").value
 
         self.base_dir = get_package_share_directory("arena_evaluation")
         self.result_dir = os.path.join(self.base_dir, "data", self.result_dir)
         os.makedirs(self.result_dir, exist_ok=True)
-        
+
         self.write_params()
 
         topics_to_monitor = self.get_topics_to_monitor()
@@ -373,8 +377,8 @@ class BagRecorder(Node):
             if not match:
                 continue
             # Append a list: [full_topic_name, topic_id, topic_type]
-            topics_to_sub.append([topic_name, topic_name, self.get_class_for_topic_name(topic_name)[1]])
-
+            if (topic_class := self.get_class_for_topic_name(topic_name)) is not None:
+                topics_to_sub.append([topic_name, topic_name, topic_class[1]])
 
         self.data_collectors = []
 
@@ -389,6 +393,32 @@ class BagRecorder(Node):
         # Write extra information as needed (episode and start_goal can be recorded as parameters or in a separate bag topic)
         self.current_episode = 0
         self.current_time = None
+
+        # --- Setup rosbag2 writer ---
+
+        bag_uri = os.path.join(self.result_dir, "recording")
+        storage_options = StorageOptions(uri=bag_uri, storage_id='sqlite3')
+        converter_options = ConverterOptions(
+            input_serialization_format='cdr',
+            output_serialization_format='cdr'
+        )
+        self.writer = SequentialWriter()
+        self.writer.open(storage_options, converter_options)
+        # Create topic metadata for each topic that will be recorded.
+        self.topics_metadata = {}
+        for topic in topics_to_sub:
+            topic_name = topic[0]
+            msg_type = topic[2]
+            # Construct the type string. This follows the convention "package/msg/MessageType"
+            type_str = f"{os.path.dirname(msg_type.__module__.replace('.', '/'))}/{msg_type.__name__}"
+            metadata = TopicMetadata(
+                name=topic_name.strip('/'),
+                type=type_str,
+                serialization_format='cdr',
+                offered_qos_profiles=''
+            )
+            self.writer.create_topic(metadata)
+            self.topics_metadata[topic_name] = metadata
 
         # Setup QoS for clock and scenario reset subscriptions
         self.qos = QoSProfile(
@@ -416,32 +446,6 @@ class BagRecorder(Node):
             'change_directory',
             self.change_directory_callback
         )
-
-        # --- Setup rosbag2 writer ---
-
-        bag_uri = os.path.join(self.result_dir, "my_rosbag")
-        storage_options = StorageOptions(uri=bag_uri, storage_id='sqlite3')
-        converter_options = ConverterOptions(
-            input_serialization_format='cdr',
-            output_serialization_format='cdr'
-        )
-        self.writer = SequentialWriter()
-        self.writer.open(storage_options, converter_options)
-        # Create topic metadata for each topic that will be recorded.
-        self.topics_metadata = {}
-        for topic in topics_to_sub:
-            topic_name = topic[0]
-            msg_type = topic[2]
-            # Construct the type string. This follows the convention "package/msg/MessageType"
-            type_str = f"{msg_type.__module__.replace('.', '/')}/{msg_type.__name__}"
-            metadata = TopicMetadata(
-                name=topic_name,
-                type=type_str,
-                serialization_format='cdr',
-                offered_qos_profiles=''
-            )
-            self.writer.create_topic(metadata)
-            self.topics_metadata[topic_name] = metadata
 
         self.get_logger().info(f"Started recording to rosbag at: {bag_uri}")
 
@@ -487,7 +491,7 @@ class BagRecorder(Node):
             }, file)
 
     def get_topics_to_monitor(self):
-        namespace = self.get_namespace().strip("/")
+        namespace = self.get_namespace()
         return [
             (f"{namespace}/scan", LaserScan),
             (f"{namespace}/scenario_reset", Int16),
@@ -505,8 +509,8 @@ class BagRecorder(Node):
             return ["cmd_vel", Twist]
         if "/scenario_reset" in topic_name:
             return ["scenario_reset", Int16]
-        if "/human_states" in topic_name:   
-            return ["human_states", Agents] #hunav topic
+        if "/human_states" in topic_name:
+            return ["human_states", Agents]  # hunav topic
         # if "/pedsim_agents_data" in topic_name:
         #     return ["pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe]
 
@@ -527,16 +531,17 @@ class BagRecorder(Node):
 
         # For each DataCollector, retrieve the last message and record it into the rosbag.
         for collector in self.data_collectors:
-            topic_name, msg = collector.get_data()
+            topic_name = collector.full_topic_name
+            msg = collector.msg
+            # self.get_logger().warn(f"collected {topic_name}: {msg}")
+
             if msg is None:
                 continue
             try:
                 serialized_msg = serialize_message(msg)
-
-                self.writer.write(topic_name, serialized_msg, self.current_time)
-            except Exception as e:
+                self.writer.write(topic_name.strip('/'), serialized_msg, self.current_time)
+            except BaseException as e:
                 self.get_logger().error(f"Error writing message on topic {topic_name}: {e}")
-
 
     def scenario_reset_callback(self, data: Int16):
         self.current_episode = data.data
@@ -555,15 +560,15 @@ class BagRecorder(Node):
 
 
 def main(args=None):
-    
+
     rclpy.init(args=args)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", "-d", default="auto:/")
-    arguments, extra_args = parser.parse_known_args() # Parse the known arguments and ignore the extra_args
+    arguments, extra_args = parser.parse_known_args()  # Parse the known arguments and ignore the extra_args
 
     try:
-        recorder = Recorder(arguments.dir)
+        recorder = BagRecorder(arguments.dir)
 
         executor = MultiThreadedExecutor()
         executor.add_node(recorder)
@@ -573,13 +578,14 @@ def main(args=None):
 
         executor.spin()
 
-    except Exception as e:
+    except BaseException as e:
         print(f"Exception in main: {e}")
         traceback.print_exc()
+        raise e
     finally:
-        recorder.destroy_node()
+        # recorder.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()
-    
