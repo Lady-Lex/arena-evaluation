@@ -345,8 +345,11 @@ class PathVisualizer:
                 iterator = [episode]
 
             for i in iterator:
-                path = paths_for_namespace["path"][i]
-                result = paths_for_namespace["result"][i]
+                # path = paths_for_namespace["path"][i]
+                # result = paths_for_namespace["result"][i]
+                row = paths_for_namespace.iloc[i]
+                path = row["path"]
+                result = row["result"]
 
                 if len(desired_results) > 0 and not result in desired_results:
                     break 
