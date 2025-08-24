@@ -15,6 +15,14 @@ import yaml
 import rospkg
 import json
 
+# Import shapely library for geometric calculations
+try:
+    from shapely.geometry import Point, Polygon
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    print("Warning: shapely library not available, falling back to manual polygon detection")
+    SHAPELY_AVAILABLE = False
+
 from arena_evaluation.utils import Utils
 
 class Action(str, enum.Enum):
@@ -71,6 +79,53 @@ class PedsimMetric(Metric, typing.TypedDict):
     time_looked_at_by_pedestrians: typing.List[int]
 
 
+class SubjectMetric(typing.TypedDict):
+    
+    subject_id: str
+    subject_type: str  # e.g., "doctor", "patient", "bed", "wheelchair"
+    subject_position: typing.List[typing.List[float]]  # positions over time
+    robot_subject_distances: typing.List[float]  # distances to subject over time
+    subject_scores: typing.List[float]  # computed scores over time
+    total_subject_score: float  # aggregated score for this subject
+    scoring_function_type: str  # e.g., "u_curve", "distance_penalty", "proximity_reward"
+
+
+class SubjectAwareMetric(Metric, typing.TypedDict):
+    overall_subject_score: float  # aggregated score across all subjects
+    total_violation_count: int    # Total violation count
+
+
+class ZoneViolation(typing.TypedDict):
+    
+    timestamp: int                 # Violation timestamp
+    position: typing.List[float]   # Violation position [x, y]
+    duration: int                  # Violation duration
+    severity: float               # Violation severity (based on zone type)
+    violation_type: str           # Violation type
+
+# class ZoneMetric(typing.TypedDict):
+    
+#     zone_id: str                    # Zone identifier
+#     zone_label: str                 # Zone label (e.g., "Forbidden Zone 1")
+#     zone_category: typing.List[str] # Zone category (e.g., ["storage"])
+#     zone_polygon: typing.List[typing.List[float]]  # Polygon boundary
+    
+#     # Violation statistics
+#     violations: typing.List[ZoneViolation]  # Violation record list
+#     total_violations: int           # Total violation count
+#     total_violation_time: int      # Total violation time
+    
+#     # Scoring
+#     zone_scores: typing.List[float]  # Time series scoring
+#     total_zone_score: float        # Total zone score
+#     penalty_weight: float          # Penalty weight
+
+class ZoneAwareMetric(Metric, typing.TypedDict):
+    overall_zone_score: float     # Overall zone score
+    total_violation_count: int    # Total violation count
+    total_violation_time: int      # Total violation time
+    
+    
 class Config:
     TIMEOUT_TRESHOLD = 180e9
     MAX_COLLISIONS = 3
@@ -171,6 +226,67 @@ class Math:
     @classmethod
     def angle_difference(cls, x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
             return np.pi - np.abs(np.abs(x1 - x2) - np.pi)
+
+    @classmethod
+    def point_in_polygon(cls, point, polygon):
+        """
+        Use ray casting method to determine if a point is inside a polygon (fallback method)
+        Use this method when the shapely library is not available
+        """
+        x, y = point
+        n = len(polygon)
+        inside = False
+        
+        p1x, p1y = polygon[0]
+        for i in range(n + 1):
+            p2x, p2y = polygon[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        
+        return inside
+
+    # Social scoring mathematical functions
+    
+    @classmethod
+    def u_curve_score(cls, distance: np.ndarray, optimal_distance: float, curve_width: float) -> np.ndarray:
+        """
+        Calculate U-curve scoring function for subjects like doctors.
+        Score is highest at optimal_distance and decreases as distance moves away.
+        
+        Args:
+            distance: distances to the subject
+            optimal_distance: optimal distance for highest score
+            curve_width: width parameter controlling the curve steepness
+        
+        Returns:
+            scores based on U-curve function
+        """
+        deviation = np.abs(distance - optimal_distance)
+        return 1.0 / (1.0 + (deviation / curve_width) ** 2)
+    
+    @classmethod
+    def distance_penalty_score(cls, distance: np.ndarray, safe_distance: float, penalty_weight: float = 1.0) -> np.ndarray:
+        """
+        Calculate distance penalty scoring for subjects like patients.
+        Higher penalty (lower score) when too close to the subject.
+        
+        Args:
+            distance: distances to the subject  
+            safe_distance: minimum safe distance
+            penalty_weight: weight factor for penalty strength
+        
+        Returns:
+            penalty scores (lower when too close)
+        """
+        violation = np.maximum(0, safe_distance - distance)
+        return np.exp(-penalty_weight * violation / safe_distance)
+
 
 class Metrics:
 
@@ -449,3 +565,461 @@ class PedsimMetrics(Metrics):
             time_looked_at_by_pedestrians = time_looked_at_by_pedestrians,
             num_pedestrians = peds_position.shape[1]
         )
+
+class SubjectAwareMetrics(Metrics):
+    def _load_data(self) -> List[DataFrame]:
+        # Try to load subjects data file (if exists)
+        subjects_data = pd.read_csv(
+            os.path.join(self.dir, "pedsim_agents_data.csv"),
+            converters = {"data": Utils.parse_pedsim}
+        ).rename(columns={"data": "subjects"})
+        
+        return super()._load_data() + [subjects_data]
+    
+    def __init__(self, dir: str, **kwargs):
+        # Get world and map information for configuration file path
+        self.world_name = kwargs.get('world_name', 'arena_hospital_small')
+        
+        # Load subjects configuration file
+        self.subjects_config = self._load_subjects_config()
+        
+        super().__init__(dir=dir, **kwargs)
+    
+    def _load_subjects_config(self):
+        try:
+            config_path = os.path.join(
+                rospkg.RosPack().get_path("arena_simulation_setup"),
+                "worlds",
+                self.world_name,
+                "metrics",
+                "default.yaml"
+            )
+            
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            return config.get('subjects', {})
+        except Exception as e:
+            print(f"Warning: Could not load subjects metricsconfig: {e}")
+            return {}
+    
+    def _analyze_episode(self, episode: pd.DataFrame, index) -> SubjectAwareMetric:
+        # Get basic analysis results
+        super_analysis = super()._analyze_episode(episode, index)
+        
+        # Initialize subjects related data
+        overall_subject_score = 0.0
+        total_violation_count = 0
+        
+        # Check if subjects data exists
+        if 'subjects' in episode.columns:
+            subjects_data = episode['subjects'].iloc[0] if len(episode['subjects']) > 0 else []
+            
+            if subjects_data:
+                # Get robot positions
+                robot_positions = np.array([odom["position"][:2] for odom in episode["odom"]])
+                
+                # Analyze each subject
+                for subject_id, subject_info in self.subjects_config.get('by_id', {}).items():
+                    subject_metric = self._analyze_subject(
+                        subject_id, 
+                        subject_info, 
+                        subjects_data, 
+                        robot_positions, 
+                        episode
+                    )
+                    if subject_metric:
+                        overall_subject_score += subject_metric['total_subject_score'] * subject_info.get('weight', 1.0)
+                        # Calculate violation count (based on distance threshold)
+                        violation_count = self._count_subject_violations(
+                            subject_metric['robot_subject_distances'],
+                            subject_info
+                        )
+                        total_violation_count += violation_count
+        
+        # If subjects exist, calculate weighted average score
+        if self.subjects_config.get('scoring', {}).get('normalize_by_episode_time', False):
+            episode_time = super_analysis['time_diff']
+            if episode_time > 0:
+                overall_subject_score /= episode_time
+        
+        return SubjectAwareMetric(
+            **super_analysis,
+            overall_subject_score=overall_subject_score,
+            total_violation_count=total_violation_count
+        )
+    
+    def _analyze_subject(self, subject_id, subject_config, subjects_data, robot_positions, episode):
+        """Analyze metrics for a single subject"""
+        try:
+            # Find corresponding subject data
+            subject_data = None
+            for subj in subjects_data:
+                if hasattr(subj, 'id') and str(subj.id) == subject_id:
+                    subject_data = subj
+                    break
+            
+            if not subject_data:
+                return None
+            
+            # Get subject position (if exists)
+            subject_positions = []
+            if hasattr(subject_data, 'position'):
+                subject_positions = [subject_data.position]
+            elif hasattr(subject_data, 'positions'):
+                subject_positions = subject_data.positions
+            
+            # Calculate distance from robot to subject
+            robot_subject_distances = []
+            if subject_positions and len(robot_positions) > 0:
+                for subj_pos in subject_positions:
+                    if len(subj_pos) >= 2:
+                        distances = np.linalg.norm(robot_positions - np.array(subj_pos[:2]), axis=1)
+                        robot_subject_distances.extend(distances.tolist())
+            
+            # Calculate subject score
+            scoring_type = subject_config.get('scoring', 'distance_penalty')
+            scoring_params = subject_config.get('params', {})
+            
+            subject_scores = self._calculate_subject_scores(
+                scoring_type, 
+                scoring_params, 
+                robot_subject_distances
+            )
+            
+            total_subject_score = np.mean(subject_scores) if subject_scores else 0.0
+            
+            return SubjectMetric(
+                subject_id=subject_id,
+                subject_type=getattr(subject_data, 'type', 'unknown'),
+                subject_position=subject_positions,
+                robot_subject_distances=robot_subject_distances,
+                subject_scores=subject_scores,
+                total_subject_score=total_subject_score,
+                scoring_function_type=scoring_type
+            )
+            
+        except Exception as e:
+            print(f"Error analyzing subject {subject_id}: {e}")
+            return None
+    
+    def _calculate_subject_scores(self, scoring_type, params, distances):
+        """Calculate subject scores based on different scoring functions"""
+        if not distances:
+            return []
+        
+        distances = np.array(distances)
+        
+        if scoring_type == 'u_curve':
+            optimal_distance = params.get('optimal_distance', 1.5)
+            curve_width = params.get('curve_width', 0.5)
+            
+            # U-curve scoring: highest score near optimal distance
+            scores = 1.0 - np.minimum(
+                np.abs(distances - optimal_distance) / curve_width, 
+                1.0
+            )
+            
+        elif scoring_type == 'distance_penalty':
+            safe_distance = params.get('safe_distance', 2.0)
+            penalty_weight = params.get('penalty_weight', 1.0)
+            
+            # Distance penalty: closer distance results in heavier penalty
+            scores = np.where(
+                distances < safe_distance,
+                -penalty_weight * (safe_distance - distances) / safe_distance,
+                0.0
+            )
+        
+        return scores.tolist()
+    
+    def _count_subject_violations(self, distances, subject_config):
+        """Calculate subject violation count (based on continuous violation state changes)"""
+        if not distances:
+            return 0
+        
+        distances = np.array(distances)
+        scoring_type = subject_config.get('scoring', 'distance_penalty')
+        params = subject_config.get('params', {})
+        
+        # Calculate violation state for each time step
+        if scoring_type == 'u_curve':
+            # U-curve: both too far and too close distances count as violations
+            optimal_distance = params.get('optimal_distance', 1.5)
+            tolerance = params.get('tolerance', 0.5)
+            violations = np.logical_or(
+                distances < (optimal_distance - tolerance),
+                distances > (optimal_distance + tolerance)
+            )
+        elif scoring_type == 'distance_penalty':
+            # Distance penalty: too close distance counts as violation
+            safe_distance = params.get('safe_distance', 2.0)
+            violations = distances < safe_distance
+        else:
+            violations = np.zeros_like(distances, dtype=bool)
+        
+        # Calculate continuous violation state change count
+        violation_count = 0
+        was_in_violation = False
+        
+        for is_violation in violations:
+            if is_violation and not was_in_violation:
+                # New violation starts
+                violation_count += 1
+                was_in_violation = True
+            elif not is_violation:
+                # Violation ends
+                was_in_violation = False
+        
+        return violation_count
+
+class ZoneAwareMetrics(Metrics):
+    def _load_data(self) -> List[DataFrame]:
+        # Load basic data
+        return super()._load_data()
+    
+    def __init__(self, dir: str, **kwargs):
+        # Get world and map information for configuration file path
+        self.world_name = kwargs.get('world_name', 'small_warehouse')
+        
+        # Load zones configuration file
+        self.zones_config = self._load_zones_config()
+        print(f"Loaded zones config for world '{self.world_name}': {self.zones_config}")
+        super().__init__(dir=dir, **kwargs)
+
+    def _load_zones_config(self):
+        """Load zones configuration file and specific zone definitions"""
+        zones_config = {}
+        
+        try:
+            # Load metrics configuration file
+            metrics_config_path = os.path.join(
+                rospkg.RosPack().get_path("arena_simulation_setup"),
+                "worlds",
+                self.world_name,
+                "metrics",
+                "default.yaml"
+            )
+            
+            with open(metrics_config_path, 'r') as f:
+                metrics_config = yaml.safe_load(f)
+            
+            zones_config = metrics_config.get('zones', {})
+            
+            # Load specific zone definition file
+            zones_file_path = os.path.join(
+                rospkg.RosPack().get_path("arena_simulation_setup"),
+                "worlds",
+                self.world_name,
+                "map",
+                "zones.yaml"
+            )
+            
+            with open(zones_file_path, 'r') as f:
+                zones_data = yaml.safe_load(f)
+            
+            # Merge configuration: add specific polygon data to configuration
+            for zone_info in zones_data:
+                zone_label = zone_info.get('label', 'Unknown Zone')
+                if zone_label in zones_config:
+                    # Add polygon data to configuration
+                    zones_config[zone_label]['polygons'] = zone_info.get('polygon', [])
+                    zones_config[zone_label]['category'] = zone_info.get('category', [])
+                else:
+                    # If no corresponding zone in configuration, create a default configuration
+                    zones_config[zone_label] = {
+                        'category': zone_info.get('category', ['unknown']),
+                        'penalty_type': 'zone_violation',
+                        'scoring': 'zone_penalty',
+                        'params': {
+                            'violation_penalty': -1.0,
+                            'safe_distance': 1.0,
+                            'penalty_weight': 1.0,
+                            'continuous_violation': False
+                        },
+                        'polygons': zone_info.get('polygon', [])
+                    }
+            
+            print(f"Loaded zones config for world '{self.world_name}': {list(zones_config.keys())}")
+            
+        except Exception as e:
+            print(f"Warning: Could not load zones metrics config: {e}")
+            zones_config = {}
+        
+        return zones_config
+    
+    def _analyze_episode(self, episode: pd.DataFrame, index) -> ZoneAwareMetric:
+        # Get basic analysis results
+        super_analysis = super()._analyze_episode(episode, index)
+        
+        # Get robot position data
+        robot_positions = np.array([odom["position"][:2] for odom in episode["odom"]])
+        
+        # Analyze zone violations
+        zone_violations = []
+        
+        # Check each zone type
+        for zone_label, zone_config in self.zones_config.items():
+            zone_violations.extend(
+                self._check_zone_violations(zone_label, zone_config, robot_positions, episode)
+            )
+        
+        # Calculate total violation count and total violation time
+        total_violation_count = len(zone_violations)
+        total_violation_time = sum(violation['duration'] for violation in zone_violations)
+        
+        # Calculate overall zone score (based on violation severity)
+        overall_zone_score = 0.0
+        if zone_violations:
+            # Use negative value of violation severity as score (more severe violations result in lower scores)
+            total_severity = sum(violation['severity'] for violation in zone_violations)
+            # Convert severity to 0-1 score range
+            overall_zone_score = max(0.0, 1.0 + total_severity / len(zone_violations))
+        
+        return ZoneAwareMetric(
+            **super_analysis,
+            overall_zone_score=overall_zone_score,
+            total_violation_count=total_violation_count,
+            total_violation_time=total_violation_time
+        )
+    
+    def _check_zone_violations(self, zone_type, zone_config, robot_positions, episode):
+        """Check violations for specific zone type"""
+        violations = []
+        
+        # Get zone polygon coordinates
+        polygons = zone_config.get('polygons', [])
+        
+        if not polygons:
+            return violations
+        
+        # Track violation state changes
+        was_in_violation = False
+        violation_start_time = None
+        violation_start_index = None
+        
+        # Check robot position at each time step
+        for i, robot_pos in enumerate(robot_positions):
+            # Check if robot is inside any polygon
+            is_in_zone = False
+            for polygon_points in polygons:
+                if len(polygon_points) >= 3:  # Ensure polygon has at least 3 points
+                    polygon = np.array(polygon_points)
+                    if self._is_point_in_polygon(robot_pos, polygon):
+                        is_in_zone = True
+                        break
+            
+            # Detect violation state changes
+            if is_in_zone and not was_in_violation:
+                # New violation starts
+                violation_start_time = int(episode["time"].iloc[i]) if i < len(episode["time"]) else 0
+                violation_start_index = i
+                was_in_violation = True
+                
+            elif not is_in_zone and was_in_violation:
+                # Violation ends, record violation
+                if violation_start_index is not None:
+                    # Calculate violation duration
+                    duration = i - violation_start_index
+                    
+                    # Calculate violation severity (using start position)
+                    start_robot_pos = robot_positions[violation_start_index]
+                    severity = self._calculate_violation_severity(
+                        zone_type, zone_config, start_robot_pos, violation_start_index
+                    )
+                    
+                    violation = ZoneViolation(
+                        timestamp=violation_start_time,
+                        position=start_robot_pos.tolist(),
+                        duration=duration,
+                        severity=severity,
+                        violation_type=zone_config.get('penalty_type', 'zone_violation')
+                    )
+                    violations.append(violation)
+                
+                was_in_violation = False
+                violation_start_time = None
+                violation_start_index = None
+        
+        # Handle case where violation continues at episode end
+        if was_in_violation and violation_start_index is not None:
+            duration = len(robot_positions) - violation_start_index
+            start_robot_pos = robot_positions[violation_start_index]
+            severity = self._calculate_violation_severity(
+                zone_type, zone_config, start_robot_pos, violation_start_index
+            )
+            
+            violation = ZoneViolation(
+                timestamp=violation_start_time,
+                position=start_robot_pos.tolist(),
+                duration=duration,
+                severity=severity,
+                violation_type=zone_config.get('penalty_type', 'zone_violation')
+            )
+            violations.append(violation)
+        
+        return violations
+    
+    def _is_point_in_polygon(self, point, polygon):
+        """Use ray casting method to determine if a point is inside a polygon"""
+        if not SHAPELY_AVAILABLE:
+            return Math.point_in_polygon(point, polygon)
+
+        polygon_shapely = Polygon(polygon)
+        point_shapely = Point(point)
+        return polygon_shapely.contains(point_shapely)
+    
+    def _calculate_violation_severity(self, zone_type, zone_config, robot_pos, time_index):
+        params = zone_config.get('params', {})
+        base_penalty = params.get('violation_penalty', -1.0)
+        penalty_weight = params.get('penalty_weight', 1.0)
+        
+        # Base penalty
+        severity = base_penalty * penalty_weight
+        
+        # If continuous violation accumulation penalty is supported
+        if params.get('continuous_violation', False):
+            # Here we can accumulate penalties based on time spent in restricted zone
+            # Temporarily use base penalty, can be extended later
+            pass
+        
+        # Apply maximum penalty limit
+        max_penalty = params.get('max_penalty', float('-inf'))
+        if max_penalty > float('-inf'):
+            severity = max(severity, max_penalty)
+        
+        return severity
+    
+    def _group_violations_by_zone(self, violations):
+        """Group violations by zone_id"""
+        zone_metrics = {}
+        
+        for violation in violations:
+            # Extract zone information from violation_type
+            zone_id = violation['violation_type']
+            
+            if zone_id not in zone_metrics:
+                zone_metrics[zone_id] = {
+                    'zone_id': zone_id,
+                    'total_violations': 0,
+                    'total_severity': 0.0,
+                    'violation_count': 0,
+                    'max_severity': float('-inf'),
+                    'min_severity': float('inf')
+                }
+            
+            zone_metrics[zone_id]['total_violations'] += 1
+            zone_metrics[zone_id]['total_severity'] += violation['severity']
+            zone_metrics[zone_id]['max_severity'] = max(zone_metrics[zone_id]['max_severity'], violation['severity'])
+            zone_metrics[zone_id]['min_severity'] = min(zone_metrics[zone_id]['min_severity'], violation['severity'])
+        
+        # Calculate average values
+        for zone_id in zone_metrics:
+            if zone_metrics[zone_id]['total_violations'] > 0:
+                zone_metrics[zone_id]['avg_severity'] = (
+                    zone_metrics[zone_id]['total_severity'] / zone_metrics[zone_id]['total_violations']
+                )
+            else:
+                zone_metrics[zone_id]['avg_severity'] = 0.0
+        
+        return list(zone_metrics.values())
