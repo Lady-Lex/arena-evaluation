@@ -311,7 +311,9 @@ class PathVisualizer:
         # self.scenario_file, self.scenario_content = PathVisualizer.read_scenario_file(scenario)
 
         # self.map_name = "small_warehouse" # self.scenario_content["map"]
-        self.map_name = "hospital/map"
+        # self.map_name = "hospital/map"
+        # self.map_name = "small_warehouse/map"
+        self.map_name = "arena_hospital_small/map"
         self.map_path, self.map_content = PathVisualizer.read_map_file(self.map_name)
 
         print(self.map_content)

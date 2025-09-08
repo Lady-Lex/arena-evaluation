@@ -103,22 +103,6 @@ class ZoneViolation(typing.TypedDict):
     severity: float               # Violation severity (based on zone type)
     violation_type: str           # Violation type
 
-# class ZoneMetric(typing.TypedDict):
-    
-#     zone_id: str                    # Zone identifier
-#     zone_label: str                 # Zone label (e.g., "Forbidden Zone 1")
-#     zone_category: typing.List[str] # Zone category (e.g., ["storage"])
-#     zone_polygon: typing.List[typing.List[float]]  # Polygon boundary
-    
-#     # Violation statistics
-#     violations: typing.List[ZoneViolation]  # Violation record list
-#     total_violations: int           # Total violation count
-#     total_violation_time: int      # Total violation time
-    
-#     # Scoring
-#     zone_scores: typing.List[float]  # Time series scoring
-#     total_zone_score: float        # Total zone score
-#     penalty_weight: float          # Penalty weight
 
 class ZoneAwareMetric(Metric, typing.TypedDict):
     overall_zone_score: float     # Overall zone score
