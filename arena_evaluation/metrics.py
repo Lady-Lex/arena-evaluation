@@ -564,10 +564,13 @@ class SubjectAwareMetrics(Metrics):
         # Get world and map information for configuration file path
         self.world_name = kwargs.get('world_name', 'arena_hospital_small')
         
+        # Remove world_name from kwargs before passing to parent class
+        parent_kwargs = {k: v for k, v in kwargs.items() if k != 'world_name'}
+        
         # Load subjects configuration file
         self.subjects_config = self._load_subjects_config()
         
-        super().__init__(dir=dir, **kwargs)
+        super().__init__(dir=dir, **parent_kwargs)
     
     def _load_subjects_config(self):
         try:
@@ -597,8 +600,19 @@ class SubjectAwareMetrics(Metrics):
         
         # Check if subjects data exists
         if 'subjects' in episode.columns:
-            subjects_data = episode['subjects'].iloc[0] if len(episode['subjects']) > 0 else []
+            # Find the first non-empty subjects data
+            subjects_data = []
+            for idx, row_subjects in enumerate(episode['subjects']):
+                if len(row_subjects) > 0:
+                    subjects_data = row_subjects
+                    print(f"Found subjects data at row {idx}: {len(subjects_data)} subjects")
+                    break
             
+            if not subjects_data:
+                print("No subjects data found in this episode")
+            else:
+                print("subjects_data: ", subjects_data)
+                
             if subjects_data:
                 # Get robot positions
                 robot_positions = np.array([odom["position"][:2] for odom in episode["odom"]])
@@ -698,22 +712,16 @@ class SubjectAwareMetrics(Metrics):
             optimal_distance = params.get('optimal_distance', 1.5)
             curve_width = params.get('curve_width', 0.5)
             
-            # U-curve scoring: highest score near optimal distance
-            scores = 1.0 - np.minimum(
-                np.abs(distances - optimal_distance) / curve_width, 
-                1.0
-            )
+            # Use the proper U-curve scoring function from Math class
+            scores = Math.u_curve_score(distances, optimal_distance, curve_width)
             
         elif scoring_type == 'distance_penalty':
             safe_distance = params.get('safe_distance', 2.0)
             penalty_weight = params.get('penalty_weight', 1.0)
             
-            # Distance penalty: closer distance results in heavier penalty
-            scores = np.where(
-                distances < safe_distance,
-                -penalty_weight * (safe_distance - distances) / safe_distance,
-                0.0
-            )
+            # Use the proper distance penalty scoring function from Math class
+            scores = Math.distance_penalty_score(distances, safe_distance, penalty_weight)
+
         
         return scores.tolist()
     
@@ -766,10 +774,13 @@ class ZoneAwareMetrics(Metrics):
         # Get world and map information for configuration file path
         self.world_name = kwargs.get('world_name', 'small_warehouse')
         
+        # Remove world_name from kwargs before passing to parent class
+        parent_kwargs = {k: v for k, v in kwargs.items() if k != 'world_name'}
+        
         # Load zones configuration file
         self.zones_config = self._load_zones_config()
         print(f"Loaded zones config for world '{self.world_name}': {self.zones_config}")
-        super().__init__(dir=dir, **kwargs)
+        super().__init__(dir=dir, **parent_kwargs)
 
     def _load_zones_config(self):
         """Load zones configuration file and specific zone definitions"""
@@ -816,7 +827,7 @@ class ZoneAwareMetrics(Metrics):
                         'penalty_type': 'zone_violation',
                         'scoring': 'zone_penalty',
                         'params': {
-                            'violation_penalty': -1.0,
+                            'violation_penalty': 0.0,
                             'safe_distance': 1.0,
                             'penalty_weight': 1.0,
                             'continuous_violation': False
@@ -848,6 +859,8 @@ class ZoneAwareMetrics(Metrics):
                 self._check_zone_violations(zone_label, zone_config, robot_positions, episode)
             )
         
+        # print(zone_violations)
+        
         # Calculate total violation count and total violation time
         total_violation_count = len(zone_violations)
         total_violation_time = sum(violation['duration'] for violation in zone_violations)
@@ -857,8 +870,10 @@ class ZoneAwareMetrics(Metrics):
         if zone_violations:
             # Use negative value of violation severity as score (more severe violations result in lower scores)
             total_severity = sum(violation['severity'] for violation in zone_violations)
+            # print(total_severity, len(zone_violations))
             # Convert severity to 0-1 score range
-            overall_zone_score = max(0.0, 1.0 + total_severity / len(zone_violations))
+            overall_zone_score = 1.0 + total_severity / len(zone_violations)
+            # print(overall_zone_score)
         
         return ZoneAwareMetric(
             **super_analysis,
@@ -906,10 +921,10 @@ class ZoneAwareMetrics(Metrics):
                     # Calculate violation duration
                     duration = i - violation_start_index
                     
-                    # Calculate violation severity (using start position)
+                    # Calculate violation severity (using start position and duration)
                     start_robot_pos = robot_positions[violation_start_index]
                     severity = self._calculate_violation_severity(
-                        zone_type, zone_config, start_robot_pos, violation_start_index
+                        zone_type, zone_config, start_robot_pos, violation_start_index, duration
                     )
                     
                     violation = ZoneViolation(
@@ -930,7 +945,7 @@ class ZoneAwareMetrics(Metrics):
             duration = len(robot_positions) - violation_start_index
             start_robot_pos = robot_positions[violation_start_index]
             severity = self._calculate_violation_severity(
-                zone_type, zone_config, start_robot_pos, violation_start_index
+                zone_type, zone_config, start_robot_pos, violation_start_index, duration
             )
             
             violation = ZoneViolation(
@@ -953,9 +968,9 @@ class ZoneAwareMetrics(Metrics):
         point_shapely = Point(point)
         return polygon_shapely.contains(point_shapely)
     
-    def _calculate_violation_severity(self, zone_type, zone_config, robot_pos, time_index):
+    def _calculate_violation_severity(self, zone_type, zone_config, robot_pos, time_index, duration):
         params = zone_config.get('params', {})
-        base_penalty = params.get('violation_penalty', -1.0)
+        base_penalty = params.get('violation_penalty', 0.0)
         penalty_weight = params.get('penalty_weight', 1.0)
         
         # Base penalty
@@ -963,13 +978,16 @@ class ZoneAwareMetrics(Metrics):
         
         # If continuous violation accumulation penalty is supported
         if params.get('continuous_violation', False):
-            # Here we can accumulate penalties based on time spent in restricted zone
-            # Temporarily use base penalty, can be extended later
-            pass
+            # Time-based penalty: severity increases with duration
+            # You can adjust the time multiplier as needed
+            time_multiplier = params.get('time_multiplier', 0.1)  # Penalty per time step
+            time_penalty = duration * time_multiplier
+            severity = severity + (base_penalty * time_penalty)
         
-        # Apply maximum penalty limit
+        # Apply maximum penalty limit (prevent penalty from being too severe)
         max_penalty = params.get('max_penalty', float('-inf'))
         if max_penalty > float('-inf'):
+            # For negative values, we want severity to be >= max_penalty (less negative)
             severity = max(severity, max_penalty)
         
         return severity

@@ -30,13 +30,13 @@ if __name__ == "__main__":
             dir = arguments.dir,
             world_name = arguments.world_name
         )
-    metrics.data.to_csv(os.path.join(arguments.dir, "metrics_subject.csv"))
+        metrics.data.to_csv(os.path.join(arguments.dir, "metrics_subject.csv"))
     
     if arguments.zone:
         metrics = Metrics.ZoneAwareMetrics(
             dir = arguments.dir,
             world_name = arguments.world_name
         )
-    metrics.data.to_csv(os.path.join(arguments.dir, "metrics_zone.csv"))
+        metrics.data.to_csv(os.path.join(arguments.dir, "metrics_zone.csv"))
 
     
