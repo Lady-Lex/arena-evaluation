@@ -814,26 +814,14 @@ class ZoneAwareMetrics(Metrics):
                 zones_data = yaml.safe_load(f)
             
             # Merge configuration: add specific polygon data to configuration
+            # Only process zones that are explicitly defined in default.yaml
             for zone_info in zones_data:
                 zone_label = zone_info.get('label', 'Unknown Zone')
                 if zone_label in zones_config:
                     # Add polygon data to configuration
                     zones_config[zone_label]['polygons'] = zone_info.get('polygon', [])
                     zones_config[zone_label]['category'] = zone_info.get('category', [])
-                else:
-                    # If no corresponding zone in configuration, create a default configuration
-                    zones_config[zone_label] = {
-                        'category': zone_info.get('category', ['unknown']),
-                        'penalty_type': 'zone_violation',
-                        'scoring': 'zone_penalty',
-                        'params': {
-                            'violation_penalty': 0.0,
-                            'safe_distance': 1.0,
-                            'penalty_weight': 1.0,
-                            'continuous_violation': False
-                        },
-                        'polygons': zone_info.get('polygon', [])
-                    }
+                # Remove the else clause - we only want zones explicitly defined in default.yaml
             
             print(f"Loaded zones config for world '{self.world_name}': {list(zones_config.keys())}")
             
@@ -859,6 +847,7 @@ class ZoneAwareMetrics(Metrics):
                 self._check_zone_violations(zone_label, zone_config, robot_positions, episode)
             )
         
+        # print("Zone Violations: ")
         # print(zone_violations)
         
         # Calculate total violation count and total violation time
@@ -866,7 +855,8 @@ class ZoneAwareMetrics(Metrics):
         total_violation_time = sum(violation['duration'] for violation in zone_violations)
         
         # Calculate overall zone score (based on violation severity)
-        overall_zone_score = 0.0
+        overall_zone_score = 1.0
+        
         if zone_violations:
             # Use negative value of violation severity as score (more severe violations result in lower scores)
             total_severity = sum(violation['severity'] for violation in zone_violations)

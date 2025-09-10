@@ -7,12 +7,16 @@ save_location: eval_tvss_nav
 # Name of the directory in ./data
 datasets:
   [
-    # "25-05-27_16-44-05/jackal",
-    # "25-05-27_17-22-22/jackal",
-    # "25-05-28_10-49-07/jackal",
-    # "25-05-28_17-00-12/jackal",
-    # "25-05-28_17-18-00/jackal",
-    "25-08-24_08-57-47/jackal",
+    "task_3_test_1/jackal",
+    "task_3_test_2/jackal",
+    "task_3_test_3/jackal",
+    "task_3_test_4/jackal",
+    "task_3_test_5/jackal",
+    "task_3_test_6/jackal",
+    "task_3_test_7/jackal",
+    "task_3_test_8/jackal",
+    "task_3_test_9/jackal",
+    "task_3_test_10/jackal",
   ]
 
 # Wether you want to plot the result counts
