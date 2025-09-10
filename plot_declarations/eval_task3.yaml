@@ -1,7 +1,7 @@
 # Wether you want to show or save the plots
 show_plots: false
 # Name of the directory in ./path
-save_location: eval_tvss_nav
+save_location: eval_task3
 
 # List of all datasets that should be compared
 # Name of the directory in ./data

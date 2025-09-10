@@ -441,7 +441,11 @@ class PathVisualizer:
         return map_path, content
 
     def ros_to_real_coord(self, coord):
-        new_coord = [(c - self.map_content["origin"][i]) / self.map_content["resolution"] for i, c in enumerate(coord)][:2]
+        # Ensure we only use the first 2 elements of origin for 2D coordinates
+        origin_2d = self.map_content["origin"][:2]
+        # Only use the first 2 elements of coord (x, y) for 2D mapping
+        coord_2d = coord[:2]
+        new_coord = [(c - origin_2d[i]) / self.map_content["resolution"] for i, c in enumerate(coord_2d)]
 
         new_coord[1] = - new_coord[1] + self.map_img.shape[1] # - (self.map_content["origin"][0] / self.map_content["resolution"])
 

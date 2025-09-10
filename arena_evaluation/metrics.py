@@ -855,14 +855,14 @@ class ZoneAwareMetrics(Metrics):
         total_violation_time = sum(violation['duration'] for violation in zone_violations)
         
         # Calculate overall zone score (based on violation severity)
-        overall_zone_score = 1.0
+        overall_zone_score = 100.0
         
         if zone_violations:
             # Use negative value of violation severity as score (more severe violations result in lower scores)
             total_severity = sum(violation['severity'] for violation in zone_violations)
             # print(total_severity, len(zone_violations))
-            # Convert severity to 0-1 score range
-            overall_zone_score = 1.0 + total_severity / len(zone_violations)
+            # Convert severity to 0-100 score range
+            overall_zone_score = 100.0 + total_severity / len(zone_violations)
             # print(overall_zone_score)
         
         return ZoneAwareMetric(
