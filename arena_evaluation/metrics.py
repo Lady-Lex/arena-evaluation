@@ -92,7 +92,8 @@ class SubjectMetric(typing.TypedDict):
 
 class SubjectAwareMetric(Metric, typing.TypedDict):
     overall_subject_score: float  # aggregated score across all subjects
-    total_violation_count: int    # Total violation count
+    average_subject_score: float  # average score per subject (overall / actual_subject_count)
+    subject_violation_count: int    # Total subject violation count
 
 
 class ZoneViolation(typing.TypedDict):
@@ -106,8 +107,8 @@ class ZoneViolation(typing.TypedDict):
 
 class ZoneAwareMetric(Metric, typing.TypedDict):
     overall_zone_score: float     # Overall zone score
-    total_violation_count: int    # Total violation count
-    total_violation_time: int      # Total violation time
+    zone_violation_count: int    # Total zone violation count
+    zone_violation_time: int      # Total zone violation time
     
     
 class Config:
@@ -596,7 +597,8 @@ class SubjectAwareMetrics(Metrics):
         
         # Initialize subjects related data
         overall_subject_score = 0.0
-        total_violation_count = 0
+        subject_violation_count = 0
+        actual_subject_count = 0  # Count of subjects that exist in both config and pedsim data
         
         # Check if subjects data exists
         if 'subjects' in episode.columns:
@@ -605,7 +607,7 @@ class SubjectAwareMetrics(Metrics):
             for idx, row_subjects in enumerate(episode['subjects']):
                 if len(row_subjects) > 0:
                     subjects_data = row_subjects
-                    print(f"Found subjects data at row {idx}: {len(subjects_data)} subjects")
+                    # print(f"Found subjects data at row {idx}: {len(subjects_data)} subjects")
                     break
             
             if not subjects_data:
@@ -626,14 +628,17 @@ class SubjectAwareMetrics(Metrics):
                         robot_positions, 
                         episode
                     )
+                    print(f"Subject metric: {subject_metric}")
                     if subject_metric:
+                        print("subject_metric['total_subject_score']: ", subject_metric['total_subject_score'])
                         overall_subject_score += subject_metric['total_subject_score'] * subject_info.get('weight', 1.0)
+                        actual_subject_count += 1  # Count subjects that were successfully analyzed
                         # Calculate violation count (based on distance threshold)
                         violation_count = self._count_subject_violations(
                             subject_metric['robot_subject_distances'],
                             subject_info
                         )
-                        total_violation_count += violation_count
+                        subject_violation_count += violation_count
         
         # If subjects exist, calculate weighted average score
         if self.subjects_config.get('scoring', {}).get('normalize_by_episode_time', False):
@@ -641,10 +646,16 @@ class SubjectAwareMetrics(Metrics):
             if episode_time > 0:
                 overall_subject_score /= episode_time
         
+        # Calculate average subject score
+        average_subject_score = 0.0
+        if actual_subject_count > 0:
+            average_subject_score = overall_subject_score / actual_subject_count
+        
         return SubjectAwareMetric(
             **super_analysis,
             overall_subject_score=overall_subject_score,
-            total_violation_count=total_violation_count
+            average_subject_score=average_subject_score,
+            subject_violation_count=subject_violation_count
         )
     
     def _analyze_subject(self, subject_id, subject_config, subjects_data, robot_positions, episode):
@@ -709,14 +720,14 @@ class SubjectAwareMetrics(Metrics):
         distances = np.array(distances)
         
         if scoring_type == 'u_curve':
-            optimal_distance = params.get('optimal_distance', 1.5)
+            optimal_distance = params.get('optimal_distance', 1.0)
             curve_width = params.get('curve_width', 0.5)
             
             # Use the proper U-curve scoring function from Math class
             scores = Math.u_curve_score(distances, optimal_distance, curve_width)
             
         elif scoring_type == 'distance_penalty':
-            safe_distance = params.get('safe_distance', 2.0)
+            safe_distance = params.get('safe_distance', 1.0)
             penalty_weight = params.get('penalty_weight', 1.0)
             
             # Use the proper distance penalty scoring function from Math class
@@ -737,7 +748,7 @@ class SubjectAwareMetrics(Metrics):
         # Calculate violation state for each time step
         if scoring_type == 'u_curve':
             # U-curve: both too far and too close distances count as violations
-            optimal_distance = params.get('optimal_distance', 1.5)
+            optimal_distance = params.get('optimal_distance', 1.0)
             tolerance = params.get('tolerance', 0.5)
             violations = np.logical_or(
                 distances < (optimal_distance - tolerance),
@@ -745,8 +756,8 @@ class SubjectAwareMetrics(Metrics):
             )
         elif scoring_type == 'distance_penalty':
             # Distance penalty: too close distance counts as violation
-            safe_distance = params.get('safe_distance', 2.0)
-            violations = distances < safe_distance
+            safe_distance = params.get('safe_distance', 1.0)
+            violations = distances < (safe_distance + tolerance)
         else:
             violations = np.zeros_like(distances, dtype=bool)
         
@@ -851,8 +862,8 @@ class ZoneAwareMetrics(Metrics):
         # print(zone_violations)
         
         # Calculate total violation count and total violation time
-        total_violation_count = len(zone_violations)
-        total_violation_time = sum(violation['duration'] for violation in zone_violations)
+        zone_violation_count = len(zone_violations)
+        zone_violation_time = sum(violation['duration'] for violation in zone_violations)
         
         # Calculate overall zone score (based on violation severity)
         overall_zone_score = 100.0
@@ -861,6 +872,7 @@ class ZoneAwareMetrics(Metrics):
             # Use negative value of violation severity as score (more severe violations result in lower scores)
             total_severity = sum(violation['severity'] for violation in zone_violations)
             # print(total_severity, len(zone_violations))
+
             # Convert severity to 0-100 score range
             overall_zone_score = 100.0 + total_severity / len(zone_violations)
             # print(overall_zone_score)
@@ -868,8 +880,8 @@ class ZoneAwareMetrics(Metrics):
         return ZoneAwareMetric(
             **super_analysis,
             overall_zone_score=overall_zone_score,
-            total_violation_count=total_violation_count,
-            total_violation_time=total_violation_time
+            zone_violation_count=zone_violation_count,
+            zone_violation_time=zone_violation_time
         )
     
     def _check_zone_violations(self, zone_type, zone_config, robot_positions, episode):
@@ -916,6 +928,7 @@ class ZoneAwareMetrics(Metrics):
                     severity = self._calculate_violation_severity(
                         zone_type, zone_config, start_robot_pos, violation_start_index, duration
                     )
+                    # print("Severity: ", severity)
                     
                     violation = ZoneViolation(
                         timestamp=violation_start_time,
@@ -964,6 +977,8 @@ class ZoneAwareMetrics(Metrics):
         penalty_weight = params.get('penalty_weight', 1.0)
         
         # Base penalty
+        print("Base penalty: ", base_penalty)
+        print("Penalty weight: ", penalty_weight)
         severity = base_penalty * penalty_weight
         
         # If continuous violation accumulation penalty is supported
