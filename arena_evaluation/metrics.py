@@ -612,8 +612,8 @@ class SubjectAwareMetrics(Metrics):
             
             if not subjects_data:
                 print("No subjects data found in this episode")
-            else:
-                print("subjects_data: ", subjects_data)
+            # else:
+            #     print("subjects_data: ", subjects_data)
                 
             if subjects_data:
                 # Get robot positions
@@ -628,9 +628,10 @@ class SubjectAwareMetrics(Metrics):
                         robot_positions, 
                         episode
                     )
-                    print(f"Subject metric: {subject_metric}")
+                    
+                    # print(f"Subject metric: {subject_metric}")
                     if subject_metric:
-                        print("subject_metric['total_subject_score']: ", subject_metric['total_subject_score'])
+                        # print("subject_metric['total_subject_score']: ", subject_metric['total_subject_score'])
                         overall_subject_score += subject_metric['total_subject_score'] * subject_info.get('weight', 1.0)
                         actual_subject_count += 1  # Count subjects that were successfully analyzed
                         # Calculate violation count (based on distance threshold)
@@ -649,7 +650,7 @@ class SubjectAwareMetrics(Metrics):
         # Calculate average subject score
         average_subject_score = 0.0
         if actual_subject_count > 0:
-            average_subject_score = overall_subject_score / actual_subject_count
+            average_subject_score = overall_subject_score * 100 / actual_subject_count
         
         return SubjectAwareMetric(
             **super_analysis,
@@ -744,12 +745,12 @@ class SubjectAwareMetrics(Metrics):
         distances = np.array(distances)
         scoring_type = subject_config.get('scoring', 'distance_penalty')
         params = subject_config.get('params', {})
+        tolerance = params.get('tolerance', 0.5)
         
         # Calculate violation state for each time step
         if scoring_type == 'u_curve':
             # U-curve: both too far and too close distances count as violations
             optimal_distance = params.get('optimal_distance', 1.0)
-            tolerance = params.get('tolerance', 0.5)
             violations = np.logical_or(
                 distances < (optimal_distance - tolerance),
                 distances > (optimal_distance + tolerance)
@@ -790,7 +791,7 @@ class ZoneAwareMetrics(Metrics):
         
         # Load zones configuration file
         self.zones_config = self._load_zones_config()
-        print(f"Loaded zones config for world '{self.world_name}': {self.zones_config}")
+        # print(f"Loaded zones config for world '{self.world_name}': {self.zones_config}")
         super().__init__(dir=dir, **parent_kwargs)
 
     def _load_zones_config(self):
@@ -834,7 +835,7 @@ class ZoneAwareMetrics(Metrics):
                     zones_config[zone_label]['category'] = zone_info.get('category', [])
                 # Remove the else clause - we only want zones explicitly defined in default.yaml
             
-            print(f"Loaded zones config for world '{self.world_name}': {list(zones_config.keys())}")
+            # print(f"Loaded zones config for world '{self.world_name}': {list(zones_config.keys())}")
             
         except Exception as e:
             print(f"Warning: Could not load zones metrics config: {e}")
@@ -977,8 +978,8 @@ class ZoneAwareMetrics(Metrics):
         penalty_weight = params.get('penalty_weight', 1.0)
         
         # Base penalty
-        print("Base penalty: ", base_penalty)
-        print("Penalty weight: ", penalty_weight)
+        # print("Base penalty: ", base_penalty)
+        # print("Penalty weight: ", penalty_weight)
         severity = base_penalty * penalty_weight
         
         # If continuous violation accumulation penalty is supported
