@@ -599,47 +599,42 @@ class SubjectAwareMetrics(Metrics):
         overall_subject_score = 0.0
         subject_violation_count = 0
         actual_subject_count = 0  # Count of subjects that exist in both config and pedsim data
+        total_actual_weight = 0.0  # Total weight of subjects that actually exist in this episode
         
         # Check if subjects data exists
         if 'subjects' in episode.columns:
-            # Find the first non-empty subjects data
-            subjects_data = []
-            for idx, row_subjects in enumerate(episode['subjects']):
-                if len(row_subjects) > 0:
-                    subjects_data = row_subjects
-                    # print(f"Found subjects data at row {idx}: {len(subjects_data)} subjects")
-                    break
+            # Get robot positions for all timesteps
+            robot_positions = np.array([odom["position"][:2] for odom in episode["odom"]])
             
-            if not subjects_data:
-                print("No subjects data found in this episode")
-            # else:
-            #     print("subjects_data: ", subjects_data)
+            # Get subjects data for all timesteps (time-synchronized)
+            subjects_data_timeline = episode['subjects'].tolist()
+            
+            # Analyze each subject
+            for subject_id, subject_info in self.subjects_config.get('by_id', {}).items():
+                subject_metric = self._analyze_subject_timeline(
+                    subject_id, 
+                    subject_info, 
+                    subjects_data_timeline, 
+                    robot_positions, 
+                    episode
+                )
                 
-            if subjects_data:
-                # Get robot positions
-                robot_positions = np.array([odom["position"][:2] for odom in episode["odom"]])
-                
-                # Analyze each subject
-                for subject_id, subject_info in self.subjects_config.get('by_id', {}).items():
-                    subject_metric = self._analyze_subject(
-                        subject_id, 
-                        subject_info, 
-                        subjects_data, 
-                        robot_positions, 
-                        episode
-                    )
+                # print(f"Subject metric: {subject_metric}")
+                if subject_metric:
+                    # Get weight for this subject (default is 1.0)
+                    weight = subject_info.get('average_weight', 1.0)
                     
-                    # print(f"Subject metric: {subject_metric}")
-                    if subject_metric:
-                        # print("subject_metric['total_subject_score']: ", subject_metric['total_subject_score'])
-                        overall_subject_score += subject_metric['total_subject_score'] * subject_info.get('weight', 1.0)
-                        actual_subject_count += 1  # Count subjects that were successfully analyzed
-                        # Calculate violation count (based on distance threshold)
-                        violation_count = self._count_subject_violations(
-                            subject_metric['robot_subject_distances'],
-                            subject_info
-                        )
-                        subject_violation_count += violation_count
+                    # print("subject_metric['total_subject_score']: ", subject_metric['total_subject_score'])
+                    overall_subject_score += subject_metric['total_subject_score'] * weight
+                    total_actual_weight += weight
+                    actual_subject_count += 1  # Count subjects that were successfully analyzed
+                    
+                    # Calculate violation count (based on distance threshold)
+                    violation_count = self._count_subject_violations(
+                        subject_metric['robot_subject_distances'],
+                        subject_info
+                    )
+                    subject_violation_count += violation_count
         
         # If subjects exist, calculate weighted average score
         if self.subjects_config.get('scoring', {}).get('normalize_by_episode_time', False):
@@ -647,10 +642,12 @@ class SubjectAwareMetrics(Metrics):
             if episode_time > 0:
                 overall_subject_score /= episode_time
         
-        # Calculate average subject score
+        # Calculate weighted average subject score
         average_subject_score = 0.0
-        if actual_subject_count > 0:
-            average_subject_score = overall_subject_score * 100 / actual_subject_count
+        if actual_subject_count > 0 and total_actual_weight > 0:
+            # Calculate dynamic weighted average: total_weighted_score / total_actual_weight * 100
+            # This redistributes weights among actually present subjects
+            average_subject_score = (overall_subject_score / total_actual_weight) * 100
         
         return SubjectAwareMetric(
             **super_analysis,
@@ -659,8 +656,85 @@ class SubjectAwareMetrics(Metrics):
             subject_violation_count=subject_violation_count
         )
     
+    def _analyze_subject_timeline(self, subject_id, subject_config, subjects_data_timeline, robot_positions, episode):
+        """Analyze metrics for a single subject with proper time synchronization"""
+        try:
+            robot_subject_distances = []
+            subject_positions_timeline = []
+            subject_type = 'unknown'
+            
+            # Process each timestep
+            for timestep_idx, subjects_data in enumerate(subjects_data_timeline):
+                if not subjects_data or len(subjects_data) == 0:
+                    # No subjects data at this timestep, skip
+                    continue
+                
+                # Find corresponding subject data at this timestep
+                subject_data = None
+                for subj in subjects_data:
+                    if hasattr(subj, 'id') and str(subj.id) == subject_id:
+                        subject_data = subj
+                        break
+                
+                if not subject_data:
+                    # Subject not present at this timestep, skip
+                    continue
+                
+                # Get subject position at this timestep
+                subject_position = None
+                if hasattr(subject_data, 'position'):
+                    subject_position = subject_data.position
+                elif hasattr(subject_data, 'positions'):
+                    subject_position = subject_data.positions[0] if subject_data.positions else None
+                
+                if subject_position and len(subject_position) >= 2 and timestep_idx < len(robot_positions):
+                    # Calculate distance between robot and subject at this timestep
+                    robot_pos = robot_positions[timestep_idx]
+                    distance = np.linalg.norm(robot_pos - np.array(subject_position[:2]))
+                    robot_subject_distances.append(distance)
+                    subject_positions_timeline.append(subject_position)
+                    
+                    # if subject_id == "Doctor_1":
+                    #     print("robot_pos: ", robot_pos)
+                    #     print("subject_position: ", subject_position)
+                    #     print("distance: ", distance)
+                    
+                    # Store subject type (should be consistent across timesteps)
+                    if subject_type == 'unknown':
+                        subject_type = getattr(subject_data, 'type', 'unknown')
+            
+            if not robot_subject_distances:
+                # print(f"No valid distance data found for subject {subject_id}")
+                return None
+            
+            # Calculate subject score
+            scoring_type = subject_config.get('scoring', 'distance_penalty')
+            scoring_params = subject_config.get('params', {})
+            
+            subject_scores = self._calculate_subject_scores(
+                scoring_type, 
+                scoring_params, 
+                robot_subject_distances
+            )
+            
+            total_subject_score = np.mean(subject_scores) if subject_scores else 0.0
+            
+            return SubjectMetric(
+                subject_id=subject_id,
+                subject_type=subject_type,
+                subject_position=subject_positions_timeline,
+                robot_subject_distances=robot_subject_distances,
+                subject_scores=subject_scores,
+                total_subject_score=total_subject_score,
+                scoring_function_type=scoring_type
+            )
+            
+        except Exception as e:
+            print(f"Error analyzing subject {subject_id}: {e}")
+            return None
+    
     def _analyze_subject(self, subject_id, subject_config, subjects_data, robot_positions, episode):
-        """Analyze metrics for a single subject"""
+        """Legacy method - kept for backward compatibility"""
         try:
             # Find corresponding subject data
             subject_data = None
@@ -673,6 +747,8 @@ class SubjectAwareMetrics(Metrics):
                 return None
             
             # Get subject position (if exists)
+            # print("robot_positions: ", robot_positions)
+            # print("subject_data: ", subject_data)
             subject_positions = []
             if hasattr(subject_data, 'position'):
                 subject_positions = [subject_data.position]
@@ -686,6 +762,11 @@ class SubjectAwareMetrics(Metrics):
                     if len(subj_pos) >= 2:
                         distances = np.linalg.norm(robot_positions - np.array(subj_pos[:2]), axis=1)
                         robot_subject_distances.extend(distances.tolist())
+            
+            # if subject_id == "Doctor_1":
+            #     print("robot_positions: ", robot_positions)
+            #     print("subject_positions: ", subject_positions)
+            #     print("robot_subject_distances: ", robot_subject_distances)
             
             # Calculate subject score
             scoring_type = subject_config.get('scoring', 'distance_penalty')
