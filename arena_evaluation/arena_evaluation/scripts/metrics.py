@@ -20,6 +20,14 @@ from ament_index_python.packages import get_package_share_directory
 from arena_evaluation.scripts.utils import Utils
 
 
+# Optional dependency for polygon checks (zone metrics)
+try:
+    from shapely.geometry import Point, Polygon
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    SHAPELY_AVAILABLE = False
+
+
 class Action(str, enum.Enum):
     STOP = "STOP"
     ROTATE = "ROTATE"
@@ -58,6 +66,38 @@ class Metric(typing.TypedDict):
 
 #    action_type: typing.List[Action]
     result: DoneReason
+
+
+class SubjectMetric(typing.TypedDict):
+
+    subject_id: str
+    subject_type: str
+    subject_position: typing.List[typing.List[float]]
+    robot_subject_distances: typing.List[float]
+    subject_scores: typing.List[float]
+    total_subject_score: float
+    scoring_function_type: str
+
+
+class SubjectAwareMetric(Metric, typing.TypedDict):
+    overall_subject_score: float
+    average_subject_score: float
+    subject_violation_count: int
+
+
+class ZoneViolation(typing.TypedDict):
+
+    timestamp: int
+    position: typing.List[float]
+    duration: int
+    severity: float
+    violation_type: str
+
+
+class ZoneAwareMetric(Metric, typing.TypedDict):
+    overall_zone_score: float
+    zone_violation_count: int
+    zone_violation_time: int
 
 
 class Config:
@@ -162,6 +202,42 @@ class Math:
     @classmethod
     def angle_difference(cls, x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
         return np.pi - np.abs(np.abs(x1 - x2) - np.pi)
+
+    @classmethod
+    def point_in_polygon(cls, point, polygon):
+        """Ray casting point-in-polygon test (fallback when shapely is unavailable)."""
+        x, y = point
+        n = len(polygon)
+        inside = False
+
+        p1x, p1y = polygon[0]
+        for i in range(n + 1):
+            p2x, p2y = polygon[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+
+        return inside
+
+    @classmethod
+    def u_curve_score(cls, distance: np.ndarray, optimal_distance: float, curve_width: float) -> np.ndarray:
+        deviation = np.abs(distance - optimal_distance)
+        return 1.0 / (1.0 + (deviation / curve_width) ** 2)
+
+    @classmethod
+    def distance_penalty_score(
+        cls,
+        distance: np.ndarray,
+        safe_distance: float,
+        penalty_weight: float = 1.0
+    ) -> np.ndarray:
+        violation = np.maximum(0, safe_distance - distance)
+        return np.exp(-penalty_weight * violation / safe_distance)
 
 
 class Metrics:
@@ -280,36 +356,91 @@ class Metrics:
 
     def _get_robot_params(self):
 
-        # print("Current working directory:", os.getcwd())
+        params_path = os.path.join(self.dir, "params.yaml")
+        content: typing.Dict[str, typing.Any] = {}
+        if os.path.exists(params_path):
+            with open(params_path, "r") as file:
+                content = yaml.safe_load(file) or {}
 
-        with open(os.path.join(self.dir, "params.yaml")) as file:
+        # Determine robot model.
+        # Preferred: explicit 'model' or 'robot_model' stored in params.yaml.
+        model = (content.get("model") or content.get("robot_model") or "").strip()
+        if not model:
+            # Common recorder format: namespace: task_generator_node/<robot>
+            namespace = (content.get("namespace") or "").strip()
+            if namespace and "/" in namespace:
+                model = namespace.split("/")[-1]
 
-            content = yaml.safe_load(file)
+        if not model:
+            # Last resort: keep behavior explicit instead of silently using the wrong model.
+            raise ValueError(
+                f"Robot model could not be determined. "
+                f"Set 'model' in '{params_path}' (e.g. model: jackal) or provide a namespace ending with '/<robot>'."
+            )
 
-            model = content["model"]
+        # In arena5, robot model parameters live in arena_robots/robots/<model>/model_params.yaml
+        candidates = []
+        try:
+            candidates.append(
+                os.path.join(
+                    get_package_share_directory("arena_robots"),
+                    "robots",
+                    model,
+                    "model_params.yaml",
+                )
+            )
+        except Exception:
+            pass
 
-        # robot_model_params_file = os.path.join(
-        #     get_package_share_directory(
-        #         "arena_simulation_setup"),
-        #         "entities",
-        #         "robots",
-        #         model,
-        #         "model_params.yaml"
-        # )
+        # Fallbacks (legacy layouts)
+        try:
+            candidates.append(
+                os.path.join(
+                    get_package_share_directory("arena_simulation_setup"),
+                    "entities",
+                    "robots",
+                    model,
+                    "model_params.yaml",
+                )
+            )
+        except Exception:
+            pass
 
-        robot_model_params_file = os.path.join(
-            get_package_share_directory(
-                "arena_simulation_setup"),
-            "entities",
-            "robots",
-            "waffle",
-            "model_params.yaml"
-        )
+        robot_model_params_file = next((p for p in candidates if p and os.path.exists(p)), None)
+        if not robot_model_params_file:
+            tried = ", ".join([p for p in candidates if p])
+            raise FileNotFoundError(
+                f"Robot model params file not found for model '{model}'. Tried: {tried}"
+            )
 
         with open(robot_model_params_file, "r") as file:
-            robot_model_param = yaml.safe_load(file)
-            nested = robot_model_param['/**']['ros__parameters']
-            return nested
+            robot_model_param = yaml.safe_load(file) or {}
+
+        # Support both styles:
+        # 1) ROS params YAML: { '/**': { ros__parameters: {...} } }
+        # 2) Plain YAML mapping: { robot_radius: 0.267, ... }
+        if (
+            isinstance(robot_model_param, dict)
+            and "/**" in robot_model_param
+            and isinstance(robot_model_param.get("/**"), dict)
+            and "ros__parameters" in robot_model_param["/**"]
+        ):
+            params = robot_model_param["/**"]["ros__parameters"] or {}
+        else:
+            params = robot_model_param
+
+        if not isinstance(params, dict):
+            raise ValueError(
+                f"Invalid robot params in '{robot_model_params_file}': expected a mapping of parameters."
+            )
+
+        if "robot_radius" not in params:
+            raise KeyError(
+                f"robot_radius missing in '{robot_model_params_file}'. "
+                f"This parameter is required for collision distance thresholding."
+            )
+
+        return params
 
     def _get_mean_position(self, episode, key):
 
@@ -355,7 +486,12 @@ class Metrics:
 
         for i, scan in enumerate(laser_scans):
 
-            is_collision = len(scan[scan <= lower_bound]) > 0
+            # scan can be a numpy array (preferred) or an empty list (from empty CSV cells).
+            scan_arr = np.asarray(scan, dtype=float)
+            if scan_arr.size == 0:
+                is_collision = False
+            else:
+                is_collision = bool(np.any(scan_arr <= float(lower_bound)))
 
             collisions_marker.append(is_collision)
 
@@ -473,3 +609,523 @@ class PedsimMetrics(Metrics):
             time_looked_at_by_pedestrians=time_looked_at_by_pedestrians,
             num_pedestrians=peds_position.shape[1]
         )
+
+
+class SubjectAwareMetrics(Metrics):
+    def _load_data(self) -> List[DataFrame]:
+        subjects_data = pd.read_csv(
+            os.path.join(self.dir, "pedsim_agents_data.csv"),
+            converters={"data": Utils.parse_pedsim}
+        ).rename(columns={"data": "subjects"})
+
+        return super()._load_data() + [subjects_data]
+
+    def __init__(self, dir: str, **kwargs):
+        self.world_name = kwargs.get("world_name", "arena_hospital_small")
+        parent_kwargs = {k: v for k, v in kwargs.items() if k != "world_name"}
+
+        self.subjects_config = self._load_subjects_config()
+
+        super().__init__(dir=dir, **parent_kwargs)
+
+    def _load_subjects_config(self):
+        config_path = os.path.join(
+            get_package_share_directory("arena_simulation_setup"),
+            "worlds",
+            self.world_name,
+            "metrics",
+            "default.yaml",
+        )
+
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"Subject metrics config not found: '{config_path}'. "
+                f"Create '<world>/metrics/default.yaml' or pass a valid world_name."
+            )
+
+        with open(config_path, "r") as file:
+            config = yaml.safe_load(file) or {}
+
+        subjects_config = config.get("subjects", {})
+        if subjects_config is None:
+            subjects_config = {}
+        if not isinstance(subjects_config, dict):
+            raise ValueError(
+                f"Invalid subjects config in '{config_path}': expected a mapping under 'subjects'."
+            )
+
+        # Preferred: subjects.by_name (e.g. "hunav_20").
+        by_name = subjects_config.get("by_name", {})
+        if by_name is None:
+            by_name = {}
+        if not isinstance(by_name, dict):
+            raise ValueError(
+                f"Invalid subjects.by_name config in '{config_path}': expected a mapping under 'subjects.by_name'."
+            )
+
+        # Legacy compatibility: subjects.by_id (e.g. "20").
+        by_id = subjects_config.get("by_id", {})
+        if by_id is None:
+            by_id = {}
+        if not isinstance(by_id, dict):
+            raise ValueError(
+                f"Invalid subjects.by_id config in '{config_path}': expected a mapping under 'subjects.by_id'."
+            )
+
+        default_cfg = subjects_config.get("default")
+        if default_cfg is not None and not isinstance(default_cfg, dict):
+            raise ValueError(
+                f"Invalid subjects.default config in '{config_path}': expected a mapping under 'subjects.default'."
+            )
+
+        return subjects_config
+
+    def _get_subject_config_for_key(self, subject_key: str):
+        by_name = self.subjects_config.get("by_name", {}) or {}
+        if subject_key in by_name:
+            return by_name[subject_key] or {}
+
+        # Legacy fallback: allow configuring by numeric ID.
+        by_id = self.subjects_config.get("by_id", {}) or {}
+        if subject_key in by_id:
+            return by_id[subject_key] or {}
+
+        default_cfg = self.subjects_config.get("default")
+        if default_cfg is None:
+            return None
+        return default_cfg or {}
+
+    def _subject_key_from_entry(self, subj) -> typing.Optional[str]:
+        # parse_pedsim returns Pedestrian(id, type, ...). For HuNav recordings,
+        # Utils.parse_pedsim maps dict key 'name' into the Pedestrian 'type' field.
+        if subj is None:
+            return None
+
+        if isinstance(subj, dict):
+            for k in ("name", "type", "id"):
+                v = subj.get(k)
+                if v is not None and str(v) != "":
+                    return str(v)
+            return None
+
+        for attr in ("name", "type", "id"):
+            if hasattr(subj, attr):
+                v = getattr(subj, attr)
+                if v is not None and str(v) != "":
+                    return str(v)
+
+        return None
+
+    def _collect_observed_subject_keys(self, subjects_data_timeline) -> typing.Set[str]:
+        observed: typing.Set[str] = set()
+        for subjects_data in subjects_data_timeline:
+            if not subjects_data:
+                continue
+            for subj in subjects_data:
+                key = self._subject_key_from_entry(subj)
+                if key:
+                    observed.add(key)
+        return observed
+
+    def _analyze_episode(self, episode: pd.DataFrame, index) -> SubjectAwareMetric:
+        super_analysis = super()._analyze_episode(episode, index)
+
+        overall_subject_score = 0.0
+        subject_violation_count = 0
+        actual_subject_count = 0
+        total_actual_weight = 0.0
+
+        if "subjects" in episode.columns:
+            robot_positions = np.array([odom["position"][:2] for odom in episode["odom"]])
+            subjects_data_timeline = episode["subjects"].tolist()
+
+            configured_keys = set((self.subjects_config.get("by_name", {}) or {}).keys())
+            # Legacy: include any explicitly configured by_id entries too.
+            configured_keys.update(set((self.subjects_config.get("by_id", {}) or {}).keys()))
+            observed_keys = self._collect_observed_subject_keys(subjects_data_timeline)
+            subject_keys_to_check = sorted(configured_keys.union(observed_keys))
+
+            for subject_key in subject_keys_to_check:
+                subject_info = self._get_subject_config_for_key(subject_key)
+                if subject_info is None:
+                    continue
+
+                subject_metric = self._analyze_subject_timeline(
+                    subject_key,
+                    subject_info,
+                    subjects_data_timeline,
+                    robot_positions,
+                    episode,
+                )
+
+                if subject_metric:
+                    weight = subject_info.get("average_weight", 1.0)
+                    overall_subject_score += subject_metric["total_subject_score"] * weight
+                    total_actual_weight += weight
+                    actual_subject_count += 1
+
+                    violation_count = self._count_subject_violations(
+                        subject_metric["robot_subject_distances"],
+                        subject_info,
+                    )
+                    subject_violation_count += violation_count
+
+        if self.subjects_config.get("scoring", {}).get("normalize_by_episode_time", False):
+            episode_time = super_analysis["time_diff"]
+            if episode_time > 0:
+                overall_subject_score /= episode_time
+
+        average_subject_score = 0.0
+        if actual_subject_count > 0 and total_actual_weight > 0:
+            average_subject_score = (overall_subject_score / total_actual_weight) * 100
+
+        return SubjectAwareMetric(
+            **super_analysis,
+            overall_subject_score=overall_subject_score,
+            average_subject_score=average_subject_score,
+            subject_violation_count=subject_violation_count,
+        )
+
+    def _analyze_subject_timeline(self, subject_key, subject_config, subjects_data_timeline, robot_positions, episode):
+        try:
+            robot_subject_distances = []
+            subject_positions_timeline = []
+            subject_type = "unknown"
+
+            for timestep_idx, subjects_data in enumerate(subjects_data_timeline):
+                if not subjects_data or len(subjects_data) == 0:
+                    continue
+
+                subject_data = None
+                for subj in subjects_data:
+                    match_key = self._subject_key_from_entry(subj)
+                    if match_key is not None and match_key == str(subject_key):
+                        subject_data = subj
+                        break
+
+                if not subject_data:
+                    continue
+
+                subject_position = None
+                if hasattr(subject_data, "position"):
+                    subject_position = subject_data.position
+                elif hasattr(subject_data, "positions"):
+                    subject_position = subject_data.positions[0] if subject_data.positions else None
+
+                if subject_position and len(subject_position) >= 2 and timestep_idx < len(robot_positions):
+                    robot_pos = robot_positions[timestep_idx]
+                    distance = np.linalg.norm(robot_pos - np.array(subject_position[:2]))
+                    robot_subject_distances.append(distance)
+                    subject_positions_timeline.append(subject_position)
+
+                    if subject_type == "unknown":
+                        if isinstance(subject_data, dict):
+                            subject_type = subject_data.get("type", "unknown")
+                        else:
+                            subject_type = getattr(subject_data, "type", "unknown")
+
+            if not robot_subject_distances:
+                return None
+
+            scoring_type = subject_config.get("scoring", "distance_penalty")
+            scoring_params = subject_config.get("params", {})
+
+            subject_scores = self._calculate_subject_scores(
+                scoring_type,
+                scoring_params,
+                robot_subject_distances,
+            )
+
+            total_subject_score = np.mean(subject_scores) if subject_scores else 0.0
+
+            return SubjectMetric(
+                subject_id=str(subject_key),
+                subject_type=subject_type,
+                subject_position=subject_positions_timeline,
+                robot_subject_distances=robot_subject_distances,
+                subject_scores=subject_scores,
+                total_subject_score=total_subject_score,
+                scoring_function_type=scoring_type,
+            )
+        except Exception as e:
+            print(f"Error analyzing subject {subject_id}: {e}")
+            return None
+
+    def _calculate_subject_scores(self, scoring_type, params, distances):
+        if not distances:
+            return []
+
+        distances = np.array(distances)
+
+        if scoring_type == "u_curve":
+            optimal_distance = params.get("optimal_distance", 1.0)
+            curve_width = params.get("curve_width", 0.5)
+            scores = Math.u_curve_score(distances, optimal_distance, curve_width)
+        elif scoring_type == "distance_penalty":
+            safe_distance = params.get("safe_distance", 1.0)
+            penalty_weight = params.get("penalty_weight", 1.0)
+            scores = Math.distance_penalty_score(distances, safe_distance, penalty_weight)
+        else:
+            scores = np.zeros_like(distances, dtype=float)
+
+        return scores.tolist()
+
+    def _count_subject_violations(self, distances, subject_config):
+        if not distances:
+            return 0
+
+        distances = np.array(distances)
+        scoring_type = subject_config.get("scoring", "distance_penalty")
+        params = subject_config.get("params", {})
+        tolerance = params.get("tolerance", 0.5)
+
+        if scoring_type == "u_curve":
+            optimal_distance = params.get("optimal_distance", 1.0)
+            violations = np.logical_or(
+                distances < (optimal_distance - tolerance),
+                distances > (optimal_distance + tolerance),
+            )
+        elif scoring_type == "distance_penalty":
+            safe_distance = params.get("safe_distance", 1.0)
+            violations = distances < (safe_distance + tolerance)
+        else:
+            violations = np.zeros_like(distances, dtype=bool)
+
+        violation_count = 0
+        was_in_violation = False
+
+        for is_violation in violations:
+            if is_violation and not was_in_violation:
+                violation_count += 1
+                was_in_violation = True
+            elif not is_violation:
+                was_in_violation = False
+
+        return violation_count
+
+
+class ZoneAwareMetrics(Metrics):
+    def _load_data(self) -> List[DataFrame]:
+        return super()._load_data()
+
+    def __init__(self, dir: str, **kwargs):
+        self.world_name = kwargs.get("world_name", "small_warehouse")
+        parent_kwargs = {k: v for k, v in kwargs.items() if k != "world_name"}
+
+        self.zones_scoring_config = {}
+        self.zones_config = self._load_zones_config()
+
+        super().__init__(dir=dir, **parent_kwargs)
+
+    def _load_zones_config(self):
+        base = get_package_share_directory("arena_simulation_setup")
+        metrics_config_path = os.path.join(base, "worlds", self.world_name, "metrics", "default.yaml")
+        world_yaml_path = os.path.join(base, "worlds", self.world_name, "world.yaml")
+
+        if not os.path.exists(metrics_config_path):
+            raise FileNotFoundError(
+                f"Zone metrics config not found: '{metrics_config_path}'. "
+                f"Create '<world>/metrics/default.yaml' or pass a valid world_name."
+            )
+
+        if not os.path.exists(world_yaml_path):
+            raise FileNotFoundError(
+                f"World definition file not found: '{world_yaml_path}'. "
+                f"Create '<world>/world.yaml' (with zones/corners) or pass a valid world_name."
+            )
+
+        with open(metrics_config_path, "r") as file:
+            metrics_config = yaml.safe_load(file) or {}
+
+        zones_config = metrics_config.get("zones", {})
+        if not isinstance(zones_config, dict):
+            raise ValueError(
+                f"Invalid zones config in '{metrics_config_path}': expected a mapping under 'zones'."
+            )
+
+        # Support legacy structure where a "scoring" block is included under "zones".
+        self.zones_scoring_config = zones_config.get("scoring", {}) or {}
+        zones_config = {k: v for k, v in zones_config.items() if k != "scoring"}
+
+        with open(world_yaml_path, "r") as file:
+            world_config = yaml.safe_load(file) or {}
+
+        world_zones = world_config.get("zones", [])
+        if not isinstance(world_zones, list):
+            world_zones = []
+
+        # Build a quick lookup by zone name from world.yaml
+        world_zone_by_name = {}
+        for zone in world_zones:
+            if not isinstance(zone, dict):
+                continue
+            name = zone.get("name")
+            if not name:
+                continue
+            world_zone_by_name[name] = zone
+
+        missing_world_zones = [name for name in zones_config.keys() if name not in world_zone_by_name]
+        if missing_world_zones:
+            missing_str = ", ".join(sorted(missing_world_zones))
+            raise KeyError(
+                f"Zone(s) configured in '{metrics_config_path}' but missing from '{world_yaml_path}': {missing_str}"
+            )
+
+        # Attach polygons from world.yaml corners for zones defined in default.yaml
+        for zone_name, zone_cfg in zones_config.items():
+            world_zone = world_zone_by_name.get(zone_name)
+            corners = world_zone.get("corners", [])
+            if not corners or not isinstance(corners, list):
+                raise ValueError(
+                    f"Zone '{zone_name}' in '{world_yaml_path}' has no valid 'corners' list."
+                )
+
+            polygon = []
+            for c in corners:
+                if not isinstance(c, dict):
+                    raise ValueError(
+                        f"Zone '{zone_name}' in '{world_yaml_path}' has an invalid corner entry: {c}"
+                    )
+                if "x" not in c or "y" not in c:
+                    raise ValueError(
+                        f"Zone '{zone_name}' in '{world_yaml_path}' corner is missing x/y: {c}"
+                    )
+                polygon.append([float(c["x"]), float(c["y"])])
+
+            if len(polygon) < 3:
+                raise ValueError(
+                    f"Zone '{zone_name}' in '{world_yaml_path}' has < 3 corners; cannot form a polygon."
+                )
+
+            # Keep structure compatible with existing loop: a list of polygons.
+            zone_cfg["polygons"] = [polygon]
+
+        return zones_config
+
+    def _analyze_episode(self, episode: pd.DataFrame, index) -> ZoneAwareMetric:
+        super_analysis = super()._analyze_episode(episode, index)
+
+        robot_positions = np.array([odom["position"][:2] for odom in episode["odom"]])
+
+        zone_violations = []
+        for zone_label, zone_config in self.zones_config.items():
+            zone_violations.extend(
+                self._check_zone_violations(zone_label, zone_config, robot_positions, episode)
+            )
+
+        zone_violation_count = len(zone_violations)
+        zone_violation_time = sum(violation["duration"] for violation in zone_violations)
+
+        overall_zone_score = 100.0
+        if zone_violations:
+            total_severity = sum(violation["severity"] for violation in zone_violations)
+            overall_zone_score = 100.0 + total_severity / len(zone_violations)
+
+        if self.zones_scoring_config.get("normalize_by_episode_time", False):
+            episode_time = super_analysis["time_diff"]
+            if episode_time > 0:
+                overall_zone_score /= episode_time
+
+        return ZoneAwareMetric(
+            **super_analysis,
+            overall_zone_score=overall_zone_score,
+            zone_violation_count=zone_violation_count,
+            zone_violation_time=zone_violation_time,
+        )
+
+    def _check_zone_violations(self, zone_type, zone_config, robot_positions, episode):
+        violations = []
+
+        polygons = zone_config.get("polygons", [])
+        if not polygons:
+            return violations
+
+        was_in_violation = False
+        violation_start_time = None
+        violation_start_index = None
+
+        for i, robot_pos in enumerate(robot_positions):
+            is_in_zone = False
+            for polygon_points in polygons:
+                if len(polygon_points) >= 3:
+                    polygon = np.array(polygon_points)
+                    if self._is_point_in_polygon(robot_pos, polygon):
+                        is_in_zone = True
+                        break
+
+            if is_in_zone and not was_in_violation:
+                violation_start_time = int(episode["time"].iloc[i]) if i < len(episode["time"]) else 0
+                violation_start_index = i
+                was_in_violation = True
+            elif not is_in_zone and was_in_violation:
+                if violation_start_index is not None:
+                    duration = i - violation_start_index
+                    start_robot_pos = robot_positions[violation_start_index]
+                    severity = self._calculate_violation_severity(
+                        zone_type,
+                        zone_config,
+                        start_robot_pos,
+                        violation_start_index,
+                        duration,
+                    )
+
+                    violation = ZoneViolation(
+                        timestamp=violation_start_time,
+                        position=start_robot_pos.tolist(),
+                        duration=duration,
+                        severity=severity,
+                        violation_type=zone_config.get("penalty_type", "zone_violation"),
+                    )
+                    violations.append(violation)
+
+                was_in_violation = False
+                violation_start_time = None
+                violation_start_index = None
+
+        if was_in_violation and violation_start_index is not None:
+            duration = len(robot_positions) - violation_start_index
+            start_robot_pos = robot_positions[violation_start_index]
+            severity = self._calculate_violation_severity(
+                zone_type,
+                zone_config,
+                start_robot_pos,
+                violation_start_index,
+                duration,
+            )
+
+            violation = ZoneViolation(
+                timestamp=violation_start_time,
+                position=start_robot_pos.tolist(),
+                duration=duration,
+                severity=severity,
+                violation_type=zone_config.get("penalty_type", "zone_violation"),
+            )
+            violations.append(violation)
+
+        return violations
+
+    def _is_point_in_polygon(self, point, polygon):
+        if not SHAPELY_AVAILABLE:
+            return Math.point_in_polygon(point, polygon)
+
+        polygon_shapely = Polygon(polygon)
+        point_shapely = Point(point)
+        return polygon_shapely.contains(point_shapely)
+
+    def _calculate_violation_severity(self, zone_type, zone_config, robot_pos, time_index, duration):
+        params = zone_config.get("params", {})
+        base_penalty = params.get("violation_penalty", 0.0)
+        penalty_weight = params.get("penalty_weight", 1.0)
+
+        severity = base_penalty * penalty_weight
+
+        if params.get("continuous_violation", False):
+            time_multiplier = params.get("time_multiplier", 0.1)
+            time_penalty = duration * time_multiplier
+            severity = severity + (base_penalty * time_penalty)
+
+        max_penalty = params.get("max_penalty", float("-inf"))
+        if max_penalty > float("-inf"):
+            severity = max(severity, max_penalty)
+
+        return severity
