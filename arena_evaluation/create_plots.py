@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import seaborn as sns
 import pandas as pd
 import rospkg
@@ -11,7 +9,7 @@ import matplotlib.pyplot as plt
 import json
 import yaml
 
-from arena_evaluation.utils import Utils
+from utils import Utils
 
 """
     TODO: 
@@ -310,10 +308,7 @@ class PathVisualizer:
     def __init__(self, scenario):
         # self.scenario_file, self.scenario_content = PathVisualizer.read_scenario_file(scenario)
 
-        # self.map_name = "small_warehouse" # self.scenario_content["map"]
-        # self.map_name = "hospital/map"
-        # self.map_name = "small_warehouse/map"
-        self.map_name = "arena_hospital_small/map"
+        self.map_name = "small_warehouse" # self.scenario_content["map"]
         self.map_path, self.map_content = PathVisualizer.read_map_file(self.map_name)
 
         print(self.map_content)
@@ -347,11 +342,8 @@ class PathVisualizer:
                 iterator = [episode]
 
             for i in iterator:
-                # path = paths_for_namespace["path"][i]
-                # result = paths_for_namespace["result"][i]
-                row = paths_for_namespace.iloc[i]
-                path = row["path"]
-                result = row["result"]
+                path = paths_for_namespace["path"][i]
+                result = paths_for_namespace["result"][i]
 
                 if len(desired_results) > 0 and not result in desired_results:
                     break 
@@ -433,7 +425,7 @@ class PathVisualizer:
 
     @staticmethod
     def read_map_file(map_name):
-        map_path = os.path.join(rospkg.RosPack().get_path("arena_simulation_setup"), "worlds", map_name)
+        map_path = os.path.join(rospkg.RosPack().get_path("arena-simulation-setup"), "maps", map_name)
 
         with open(os.path.join(map_path, "map.yaml")) as file:
             content = yaml.safe_load(file)
@@ -441,11 +433,7 @@ class PathVisualizer:
         return map_path, content
 
     def ros_to_real_coord(self, coord):
-        # Ensure we only use the first 2 elements of origin for 2D coordinates
-        origin_2d = self.map_content["origin"][:2]
-        # Only use the first 2 elements of coord (x, y) for 2D mapping
-        coord_2d = coord[:2]
-        new_coord = [(c - origin_2d[i]) / self.map_content["resolution"] for i, c in enumerate(coord_2d)]
+        new_coord = [(c - self.map_content["origin"][i]) / self.map_content["resolution"] for i, c in enumerate(coord)][:2]
 
         new_coord[1] = - new_coord[1] + self.map_img.shape[1] # - (self.map_content["origin"][0] / self.map_content["resolution"])
 

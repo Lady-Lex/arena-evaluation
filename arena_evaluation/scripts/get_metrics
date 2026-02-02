@@ -7,7 +7,10 @@ import arena_evaluation.metrics as Metrics
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("dir")
+    parser.add_argument("world_name")
     parser.add_argument("--pedsim", action="store_const", const=True, default=False)
+    parser.add_argument("--subject", action="store_const", const=True, default=False)
+    parser.add_argument("--zone", action="store_const", const=True, default=False)
     arguments = parser.parse_args()
 
     if arguments.pedsim:
@@ -21,3 +24,19 @@ if __name__ == "__main__":
         )
 
     metrics.data.to_csv(os.path.join(arguments.dir, "metrics.csv"))
+    
+    if arguments.subject:
+        metrics = Metrics.SubjectAwareMetrics(
+            dir = arguments.dir,
+            world_name = arguments.world_name
+        )
+        metrics.data.to_csv(os.path.join(arguments.dir, "metrics_subject.csv"))
+    
+    if arguments.zone:
+        metrics = Metrics.ZoneAwareMetrics(
+            dir = arguments.dir,
+            world_name = arguments.world_name
+        )
+        metrics.data.to_csv(os.path.join(arguments.dir, "metrics_zone.csv"))
+
+    
