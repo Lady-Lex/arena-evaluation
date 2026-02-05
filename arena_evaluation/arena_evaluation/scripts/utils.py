@@ -14,14 +14,28 @@ class Pedestrian(typing.NamedTuple):
 class Utils:
     @staticmethod
     def string_to_float_list(d):
+        # Always return a numpy array so downstream numeric ops work.
+        # Empty cells in CSV should become an empty float array.
         if not d:
-            return []
+            return np.array([], dtype=float)
 
         return np.array(d.replace("[", "").replace("]", "").split(r", ")).astype(float)
 
     @classmethod
     def parse_pedsim(cls, entry: str) -> typing.List[Pedestrian]:
-        return [Pedestrian(**ped) for ped in ast.literal_eval(entry)]
+        peds = ast.literal_eval(entry)
+        out: typing.List[Pedestrian] = []
+        for ped in peds:
+            # Backward/forward compatibility:
+            # - legacy schema uses key `type`
+            # - report-friendly schema may use key `name` instead
+            if "type" not in ped and "name" in ped:
+                ped["type"] = ped["name"]
+
+            # Ignore any extra keys to keep metrics robust.
+            filtered = {k: ped[k] for k in Pedestrian._fields if k in ped}
+            out.append(Pedestrian(**filtered))
+        return out
     
 
 T = typing.TypeVar("T")

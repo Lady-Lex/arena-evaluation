@@ -41,14 +41,26 @@ class DataCollector(Node):
         topic_callbacks = [
             ("scan", self.laserscan_callback),
             ("odom", self.odometry_callback),
-            ("cmd_vel", self.action_callback)
+            ("cmd_vel", self.action_callback),
+            ("human_states", self.hunav_agents_callback),
+            ("pedsim_agents_data", self.hunav_agents_callback),
             # ("pedsim_agents_data", self.pedsim_callback)
         ]
 
         # raise ValueError(topic, unique_name)
 
         try:
-            matches = (t[1] for t in topic_callbacks if t[0].endswith(os.path.basename(topic[1])))
+            # Recorder() passes: [topic_name, output_name, msg_type]
+            # BagRecorder() passes: [topic_name, topic_id, msg_type] where topic_id == topic_name
+            # We therefore match callbacks against both the real topic basename and the output basename.
+            self.topic_name = topic[0]
+            self.output_name = topic[1]
+
+            topic_basenames = {
+                os.path.basename(str(self.topic_name).strip('/')),
+                os.path.basename(str(self.output_name).strip('/')),
+            }
+            matches = (t[1] for t in topic_callbacks if t[0] in topic_basenames)
             type_callback = next(matches, lambda x: None)
 
             def callback(msg):
@@ -59,6 +71,8 @@ class DataCollector(Node):
             traceback.print_exc()
             return
 
+        # In Recorder(): this is the output CSV file stem.
+        # In BagRecorder(): this equals the real topic name.
         self.full_topic_name = topic[1]
         self.msg = None
         self.data = None
@@ -112,6 +126,57 @@ class DataCollector(Node):
             round(msg_action.linear.y, 3),
             round(msg_action.angular.z, 3)
         ]
+
+    def hunav_agents_callback(self, msg_agents: Agents):
+
+        # Convert hunav Agents to the schema expected by Utils.parse_pedsim:
+        # a stringified list of dicts with keys matching scripts/utils.py::Pedestrian.
+        pedestrians = []
+
+        for agent in msg_agents.agents:
+            # Only persons are relevant for pedestrian metrics.
+            if hasattr(agent, 'PERSON') and agent.type != agent.PERSON:
+                continue
+
+            x = round(agent.position.position.x, 3)
+            y = round(agent.position.position.y, 3)
+
+            # Use yaw directly; it is already part of hunav Agent.
+            theta = round(float(agent.yaw), 3)
+
+            # Destination: use the first goal if present, otherwise current position.
+            if getattr(agent, 'goals', None):
+                gx = round(agent.goals[0].position.x, 3)
+                gy = round(agent.goals[0].position.y, 3)
+            else:
+                gx, gy = x, y
+
+            # Map behavior to a stable, readable string.
+            beh_type = getattr(getattr(agent, 'behavior', None), 'type', None)
+            beh_state = getattr(getattr(agent, 'behavior', None), 'state', None)
+            social_state = f"beh_type={beh_type},beh_state={beh_state}"
+
+            # For reporting: encode the configured HuNav agent name into the legacy
+            # pedsim schema's `type` field.
+            agent_name = getattr(agent, 'name', '')
+            if agent_name:
+                m = re.match(r"^hunav_(\d+)$", agent_name)
+                if m:
+                    agent_name = f"hunav_{int(m.group(1)):02d}"
+                ped_type = agent_name
+            else:
+                ped_type = "PERSON"
+
+            pedestrians.append({
+                "id": str(agent.id),
+                "name": ped_type,
+                "social_state": social_state,
+                "position": [x, y],
+                "theta": theta,
+                "destination": [gx, gy],
+            })
+
+        self.data = pedestrians
 
     def get_data(self):
         return (
@@ -286,6 +351,8 @@ class Recorder(Node):
             (f"{namespace}/scenario_reset", Int16),
             (f"{namespace}/odom", Odometry),
             (f"{namespace}/cmd_vel", Twist),
+            (f"{namespace}/human_states", Agents),
+            ("/human_states", Agents),
             # ("/pedsim_simulator/pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe)
         ]
 
@@ -296,6 +363,9 @@ class Recorder(Node):
             return ["odom", Odometry]
         if "/cmd_vel" in topic_name:
             return ["cmd_vel", Twist]
+        if "/human_states" in topic_name:
+            # Keep legacy file name expected by PedsimMetrics.
+            return ["pedsim_agents_data", Agents]
         # if "/pedsim_agents_data" in topic_name:
         #     return ["pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe]
 
@@ -367,6 +437,22 @@ class BagRecorder(Node):
         self.write_params()
 
         topics_to_monitor = self.get_topics_to_monitor()
+
+        # Resolve any remappings so we record under the actual topic names.
+        # This avoids rosbag metadata listing topics that never existed on the graph
+        # (e.g. when a subscription is remapped at launch time).
+        resolved_topics_to_monitor = []
+        resolved_seen = set()
+        for topic_name, msg_type in topics_to_monitor:
+            try:
+                resolved_name = self.resolve_topic_name(topic_name)
+            except BaseException:
+                resolved_name = topic_name
+            if resolved_name in resolved_seen:
+                continue
+            resolved_seen.add(resolved_name)
+            resolved_topics_to_monitor.append((resolved_name, msg_type))
+        topics_to_monitor = resolved_topics_to_monitor
         published_topics = [t[0] for t in topics_to_monitor]
 
         topic_matcher = re.compile(f"({'|'.join([t[0] for t in topics_to_monitor])})$")
@@ -382,6 +468,11 @@ class BagRecorder(Node):
 
         self.data_collectors = []
 
+        # When using BagRecorder, we also export CSV in the same format as Recorder
+        # so that the existing metrics pipeline can be reused.
+        self._csv_topic_to_file = {}
+        human_csv_created = False
+
         self.declare_parameter('start', [0.0, 0.0, 0.0])
         self.declare_parameter('goal', [0.0, 0.0, 0.0])
         for topic in topics_to_sub:
@@ -390,9 +481,31 @@ class BagRecorder(Node):
             collector = DataCollector(topic, unique_name)
             self.data_collectors.append(collector)
 
+            # Only create CSV outputs for topics supported by DataCollector callbacks.
+            basename = os.path.basename(topic_name)
+            if basename in ("scan", "odom", "cmd_vel"):
+                self._csv_topic_to_file[topic_name] = basename
+                self.write_data(basename, ["time", "data"], mode="w")
+            elif basename in ("lidar",):
+                # Jackal's default scan topic in some Arena configs is <ns>/lidar; metrics expects scan.csv.
+                self._csv_topic_to_file[topic_name] = "scan"
+                self.write_data("scan", ["time", "data"], mode="w")
+            elif basename in ("human_states",):
+                # Keep legacy file name expected by PedsimMetrics.
+                # If multiple human_states topics are configured (e.g. robot namespace + parent namespace),
+                # only export one of them to CSV to avoid duplicated rows.
+                if not human_csv_created:
+                    self._csv_topic_to_file[topic_name] = "pedsim_agents_data"
+                    self.write_data("pedsim_agents_data", ["time", "data"], mode="w")
+                    human_csv_created = True
+
         # Write extra information as needed (episode and start_goal can be recorded as parameters or in a separate bag topic)
         self.current_episode = 0
         self.current_time = None
+
+        # Keep the same additional CSV files as Recorder
+        self.write_data("episode", ["time", "episode"], mode="w")
+        self.write_data("start_goal", ["episode", "start", "goal"], mode="w")
 
         # --- Setup rosbag2 writer ---
 
@@ -449,6 +562,12 @@ class BagRecorder(Node):
 
         self.get_logger().info(f"Started recording to rosbag at: {bag_uri}")
 
+    def write_data(self, file_name, data, mode="a"):
+        with open(f"{self.result_dir}/{file_name}.csv", mode, newline="") as file:
+            writer = csv.writer(file, delimiter=',')
+            writer.writerow(data)
+            file.close()
+
     def get_directory(self, directory: str) -> str:
         AUTO_PREFIX = "auto:/"
         PARAM_AUTO_PREFIX = "data_recorder_autoprefix"
@@ -491,17 +610,36 @@ class BagRecorder(Node):
             }, file)
 
     def get_topics_to_monitor(self):
-        namespace = self.get_namespace()
-        return [
+        namespace = self.get_namespace().rstrip('/')
+
+        # Workaround for setups where the robot runs in a child namespace (e.g. /task_generator_node/jackal)
+        # but HuNav publishes human_states in the parent namespace (e.g. /task_generator_node).
+        parts = namespace.strip('/').split('/') if namespace not in ('', '/') else []
+        parent_namespace = '/' + '/'.join(parts[:-1]) if len(parts) > 1 else namespace
+
+        topics = [
             (f"{namespace}/scan", LaserScan),
+            (f"{namespace}/front/scan", LaserScan),
+            ("/front/scan", LaserScan),
+            (f"{namespace}/lidar", LaserScan),
+            ("/lidar", LaserScan),
             (f"{namespace}/scenario_reset", Int16),
             (f"{namespace}/odom", Odometry),
             (f"{namespace}/cmd_vel", Twist),
-            (f"{namespace}/human_states", Agents),
         ]
 
+        if parent_namespace and parent_namespace != namespace:
+            topics.append((f"{parent_namespace}/human_states", Agents))
+
+        topics.extend([
+            (f"{namespace}/human_states", Agents),
+            ("/human_states", Agents),
+        ])
+
+        return topics
+
     def get_class_for_topic_name(self, topic_name: str):
-        if "/scan" in topic_name:
+        if "/scan" in topic_name or "/lidar" in topic_name:
             return ["scan", LaserScan]
         if "/odom" in topic_name:
             return ["odom", Odometry]
@@ -515,7 +653,9 @@ class BagRecorder(Node):
         #     return ["pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe]
 
     def clock_callback(self, clock: Clock):
-        current_simulation_action_time = clock.clock.sec * int(1e9) + clock.clock.nanosec
+        # Keep the same time scaling as Recorder to stay compatible with existing metrics converters.
+        # NOTE: use an integer scale to keep timestamps as int for rosbag2 writer.
+        current_simulation_action_time = clock.clock.sec * 10_000_000_000 + clock.clock.nanosec
         if self.current_time is None:
             self.current_time = current_simulation_action_time
 
@@ -531,7 +671,7 @@ class BagRecorder(Node):
 
         # For each DataCollector, retrieve the last message and record it into the rosbag.
         for collector in self.data_collectors:
-            topic_name = collector.full_topic_name
+            topic_name = collector.topic_name
             msg = collector.msg
             # self.get_logger().warn(f"collected {topic_name}: {msg}")
 
@@ -539,9 +679,22 @@ class BagRecorder(Node):
                 continue
             try:
                 serialized_msg = serialize_message(msg)
-                self.writer.write(topic_name.strip('/'), serialized_msg, self.current_time)
+                self.writer.write(topic_name.strip('/'), serialized_msg, int(self.current_time))
             except BaseException as e:
                 self.get_logger().error(f"Error writing message on topic {topic_name}: {e}")
+
+            # Additionally export CSV for supported topics
+            if topic_name in self._csv_topic_to_file:
+                _, data = collector.get_data()
+                self.write_data(self._csv_topic_to_file[topic_name], [self.current_time, data])
+
+        # Export episode and start/goal parameters in the same format as Recorder
+        self.write_data("episode", [self.current_time, self.current_episode])
+        self.write_data("start_goal", [
+            self.current_episode,
+            self.get_parameter('start').value,
+            self.get_parameter('goal').value
+        ])
 
     def scenario_reset_callback(self, data: Int16):
         self.current_episode = data.data
